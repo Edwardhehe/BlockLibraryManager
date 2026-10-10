@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AutoCAD 自动加载插件包（Plug-in Bundle）—— 本文件只注册 AutoCAD 2019-2024。
+  这是本机实际编译出来的那一版（用 AutoCAD 2020 的 acdbmgd/acmgd/accoremgd 编译，net47）。
+
+  安装：把整个 BlockLibraryManager.bundle 文件夹复制到
+          %APPDATA%\Autodesk\ApplicationPlugins\
+        重启 AutoCAD 即自动加载，输入 BLOCKLIB 打开面板。
+
+  卸载：删掉 %APPDATA%\Autodesk\ApplicationPlugins\BlockLibraryManager.bundle 即可。
+
+  另外 5 个版本组（2010-2011 / 2012 / 2013-2014 / 2015-2018 / 2025-2027）
+  需要在装有对应 AutoCAD 的机器上编译，因为每个版本的 acdbmgd.dll 版本号不同，
+  不能互相引用。编译好之后，把 DLL 放进 Contents\<版本组>\ 目录，
+  并参照同目录下的 PackageContents-full-template.xml 追加对应的 <Components> 段。
+  版本号对照见该模板文件头部注释。
+-->
+<ApplicationPackage
+    SchemaVersion="1.0"
+    AppVersion="1.0.0"
+    ProductCode="{8F4A2E7B-1C3D-4E5A-9B6C-2D7E8F1A0B3C}"
+    Name="图库管理器"
+    Description="AutoCAD 图库管理器：分类树 + 缩略图 + 拖拽插入"
+    Author="BlockLibraryManager">
+
+  <CompanyDetails Name="BlockLibraryManager" />
+
+  <Components Description="AutoCAD 2019-2024 (.NET Framework 4.7)">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R23.0" SeriesMax="R24.3" />
+    <ComponentEntry
+        AppName="BlockLibraryManager"
+        Version="1.0.0"
+        ModuleName="./Contents/CAD2019-2024/BlockLibraryManager.dll"
+        AppDescription="图库管理器"
+        LoadOnAutoCADStartup="True" />
+  </Components>
+
+</ApplicationPackage>

@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  所有版本共用的 MSBuild 配置。
+  每个 AutoCAD 版本组的 csproj 只需要设置：
+    OutputFolderName  输出目录名
+    TargetFramework   目标框架
+    AcadRefDir        AutoCAD 托管 DLL 所在目录（acdbmgd.dll / acmgd.dll / accoremgd.dll）
+    UseAccoreMgd      是否需要 accoremgd.dll（AutoCAD 2013 起需要）
+    OutputFolderName  输出目录名
+-->
+<Project>
+
+  <PropertyGroup Label="基本信息">
+    <RootNamespace>BlockLibraryManager</RootNamespace>
+    <AssemblyName>BlockLibraryManager</AssemblyName>
+    <ProductName>图库管理器</ProductName>
+    <Company>BlockLibraryManager</Company>
+    <Version>1.36.0</Version>
+    <LangVersion>7.3</LangVersion>
+    <!-- 强制按 UTF-8 读取源码，保证中文字符串不乱码 -->
+    <CodePage>65001</CodePage>
+    <PlatformTarget>x64</PlatformTarget>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <NoWarn>1591;1701;1702</NoWarn>
+    <!-- BLM_ACAD：表示宿主是 AutoCAD。中望 / 浩辰工程用的是另一份
+         Common.CadPlatform.props，不会定义这个符号，源码里那些
+         国产平台不一定实现的成员（ShowModelessDialog、CommandEnded、
+         UnknownCommand 等）会自动切到 CadHost 的反射降级实现。 -->
+    <DefineConstants>$(DefineConstants);BLM_ACAD</DefineConstants>
+    <SrcRoot>$(MSBuildThisFileDirectory)</SrcRoot>
+    <OutputPath>$(MSBuildThisFileDirectory)..\dist\$(OutputFolderName)\</OutputPath>
+  </PropertyGroup>
+
+  <!-- 共享源码：所有版本共用同一份代码 -->
+  <ItemGroup>
+    <Compile Include="$(SrcRoot)**\*.cs" Link="%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- AutoCAD 托管程序集引用。acdbmgd / acmgd 所有版本都需要；
+       accoremgd 从 AutoCAD 2013 起才存在（ApplicationServices 与 EditorInput 搬了进去）。 -->
+  <ItemGroup Condition="'$(AcadRefDir)' != ''">
+    <Reference Include="acdbmgd">
+      <HintPath>$(AcadRefDir)\acdbmgd.dll</HintPath>
+      <Private>false</Private>
+      <EmbedInteropTypes>false</EmbedInteropTypes>
+    </Reference>
+    <Reference Include="acmgd">
+      <HintPath>$(AcadRefDir)\acmgd.dll</HintPath>
+      <Private>false</Private>
+      <EmbedInteropTypes>false</EmbedInteropTypes>
+    </Reference>
+    <Reference Include="accoremgd" Condition="'$(UseAccoreMgd)' == 'true'">
+      <HintPath>$(AcadRefDir)\accoremgd.dll</HintPath>
+      <Private>false</Private>
+      <EmbedInteropTypes>false</EmbedInteropTypes>
+    </Reference>
+  </ItemGroup>
+
+  <!-- WinForms / GDI+ 引用。
+       .NET Framework 目标需要显式引用程序集；
+       .NET 8 目标改用 UseWindowsForms（会连同 System.Drawing.Common 一起引入）。 -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net8.0-windows'">
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>false</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' != 'net8.0-windows'">
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+  </ItemGroup>
+
+  <!-- 老版本 .NET Framework 的引用程序集（否则新机器上无法编译 net35/net40/net45） -->
+  <ItemGroup Condition="'$(TargetFramework)' != 'net8.0-windows'">
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
+  </ItemGroup>
+
+  <!-- AutoCAD 版本对应的条件编译符号，由各 csproj 补充 -->
+  <Target Name="ReportAcadRefMissing" BeforeTargets="BeforeBuild"
+          Condition="'$(AcadRefDir)' == '' Or !Exists('$(AcadRefDir)\acdbmgd.dll')">
+    <Message Importance="high"
+             Text="提示：未找到 AutoCAD 引用目录 '$(AcadRefDir)'。请用 -p:AcadRefDir=&quot;包含 acdbmgd.dll 的目录&quot; 指定。" />
+  </Target>
+
+</Project>

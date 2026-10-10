@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- AutoCAD 2013 / 2014  =>  .NET Framework 4.0（2013 起需要 accoremgd.dll） -->
+  <PropertyGroup>
+    <TargetFramework>net40</TargetFramework>
+    <OutputFolderName>CAD2013-2014</OutputFolderName>
+    <AssemblyTitle>图库管理器 (AutoCAD 2013-2014)</AssemblyTitle>
+    <AcadRefDir Condition="'$(AcadRefDir)' == ''">C:\Program Files\Autodesk\AutoCAD 2014</AcadRefDir>
+    <UseAccoreMgd>true</UseAccoreMgd>
+    <DefineConstants>$(DefineConstants);ACAD_2013_OR_NEWER</DefineConstants>
+  </PropertyGroup>
+
+  <Import Project="..\..\src\Common.props" />
+
+</Project>

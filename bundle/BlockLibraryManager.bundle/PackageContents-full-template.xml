@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AutoCAD 自动加载插件包（Plug-in Bundle）。
+
+  用法：
+    1. 先按 README 里的说明把各个版本组都构建出来；
+    2. 把下面 Components 里 ModuleName 指向的 DLL 拷贝到
+       本文件所在目录下的 Contents\ 对应子目录中，例如：
+         BlockLibraryManager.bundle\Contents\CAD2019-2024\BlockLibraryManager.dll
+         BlockLibraryManager.bundle\Contents\CAD2025-2027\BlockLibraryManager.dll
+    3. 把整个 BlockLibraryManager.bundle 文件夹复制到：
+         %APPDATA%\Autodesk\ApplicationPlugins\        （仅当前用户，推荐，2012+ 支持）
+       或
+         C:\Program Files\Autodesk\ApplicationPlugins\ （所有用户，需要管理员权限）
+    4. 启动 AutoCAD，插件会自动加载，输入 BLOCKLIB 即可打开面板。
+
+  注意：
+    - 每个版本组的 DLL 用不同的 .NET Framework 编译，不能混用；
+      Components 上的 SeriesMin / SeriesMax 就是用来让 AutoCAD 挑对版本的。
+    - AutoCAD 版本号对照：2010=R18.0 2011=R18.1 2012=R18.2 2013=R19.0 2014=R19.1
+      2015=R20.0 2016=R20.1 2017=R21.0 2018=R22.0 2019=R23.0 2020=R23.1
+      2021=R24.0 2022=R24.1 2023=R24.2 2024=R24.3 2025=R25.0 2026=R25.1
+    - AutoCAD 2010 / 2011 不支持 ApplicationPlugins 自动加载，请改用 NETLOAD 手工加载，
+      或在 acad.lsp / acaddoc.lsp 里加一句 (command "NETLOAD" "完整路径\\BlockLibraryManager.dll")。
+-->
+<ApplicationPackage
+    SchemaVersion="1.0"
+    AppVersion="1.0.0"
+    ProductCode="{8F4A2E7B-1C3D-4E5A-9B6C-2D7E8F1A0B3C}"
+    Name="图库管理器"
+    Description="AutoCAD 图库管理器：分类树 + 缩略图 + 拖拽插入，支持 AutoCAD 2010-2027"
+    Author="BlockLibraryManager">
+
+  <CompanyDetails Name="BlockLibraryManager" />
+
+  <Components Description="AutoCAD 2010-2011 (.NET Framework 3.5)">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R18.0" SeriesMax="R18.1" />
+    <ComponentEntry
+        AppName="BlockLibraryManager"
+        Version="1.0.0"
+        ModuleName="./Contents/CAD2010-2011/BlockLibraryManager.dll"
+        AppDescription="图库管理器"
+        LoadOnAutoCADStartup="True" />
+  </Components>
+
+  <Components Description="AutoCAD 2012 (.NET Framework 4.0)">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R18.2" SeriesMax="R18.2" />
+    <ComponentEntry
+        AppName="BlockLibraryManager"
+        Version="1.0.0"
+        ModuleName="./Contents/CAD2012/BlockLibraryManager.dll"
+        AppDescription="图库管理器"
+        LoadOnAutoCADStartup="True" />
+  </Components>
+
+  <Components Description="AutoCAD 2013-2014 (.NET Framework 4.0)">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R19.0" SeriesMax="R19.1" />
+    <ComponentEntry
+        AppName="BlockLibraryManager"
+        Version="1.0.0"
+        ModuleName="./Contents/CAD2013-2014/BlockLibraryManager.dll"
+        AppDescription="图库管理器"
+        LoadOnAutoCADStartup="True" />
+  </Components>
+
+  <Components Description="AutoCAD 2015-2018 (.NET Framework 4.5)">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R20.0" SeriesMax="R22.0" />
+    <ComponentEntry
+        AppName="BlockLibraryManager"
+        Version="1.0.0"
+        ModuleName="./Contents/CAD2015-2018/BlockLibraryManager.dll"
+        AppDescription="图库管理器"
+        LoadOnAutoCADStartup="True" />
+  </Components>
+
+  <Components Description="AutoCAD 2019-2024 (.NET Framework 4.7)">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R23.0" SeriesMax="R24.3" />
+    <ComponentEntry
+        AppName="BlockLibraryManager"
+        Version="1.0.0"
+        ModuleName="./Contents/CAD2019-2024/BlockLibraryManager.dll"
+        AppDescription="图库管理器"
+        LoadOnAutoCADStartup="True" />
+  </Components>
+
+  <Components Description="AutoCAD 2025-2027 (.NET 8)">
+    <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R25.0" SeriesMax="R25.9" />
+    <ComponentEntry
+        AppName="BlockLibraryManager"
+        Version="1.0.0"
+        ModuleName="./Contents/CAD2025-2027/BlockLibraryManager.dll"
+        AppDescription="图库管理器"
+        LoadOnAutoCADStartup="True" />
+  </Components>
+
+</ApplicationPackage>

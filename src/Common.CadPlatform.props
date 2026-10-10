@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  国产 CAD 平台（中望 CAD / 浩辰 CAD）共用的 MSBuild 配置。
+
+  与 src\Common.props 的区别只有三点：
+    1. 编译的不是 src\ 本身，而是 tools\gen-platform-src.ps1 生成的
+       "命名空间已替换"的源码（见 GeneratePlatformSource 目标）；
+    2. 引用的托管程序集换成目标平台的那几个 DLL；
+    3. 不定义 BLM_ACAD，而是定义 BLM_ZWCAD / BLM_GSTARCAD，
+       源码里那些国产平台不一定实现的成员会自动切到 CadHost 反射降级实现。
+
+  每个平台的 csproj 需要设置：
+    OutputFolderName   输出目录名（同时用作生成源码的子目录名）
+    TargetFramework    目标框架
+    CadPlatform        ZWCAD / GstarCAD
+    CadNamespace       命名空间根（ZwSoft.ZwCAD / Gssoft.Gscad）
+    CadRefDir          目标 CAD 的托管 DLL 所在目录（可用 -p:CadRefDir= 覆盖）
+    CadRefItems        需要引用的程序集文件名（不含 .dll），分号分隔
+-->
+<Project>
+
+  <PropertyGroup Label="基本信息">
+    <RootNamespace>BlockLibraryManager</RootNamespace>
+    <AssemblyName>BlockLibraryManager</AssemblyName>
+    <ProductName>图库管理器</ProductName>
+    <Company>BlockLibraryManager</Company>
+    <Version>1.36.0</Version>
+    <LangVersion>7.3</LangVersion>
+    <!-- 强制按 UTF-8 读取源码，保证中文字符串不乱码 -->
+    <CodePage>65001</CodePage>
+    <PlatformTarget>x64</PlatformTarget>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <NoWarn>1591;1701;1702</NoWarn>
+
+    <SrcRoot>$(MSBuildThisFileDirectory)</SrcRoot>
+    <ToolsRoot>$(MSBuildThisFileDirectory)..\tools\</ToolsRoot>
+    <!-- 传给 PowerShell 脚本用的路径：末尾不能是反斜杠，
+         否则会把参数里的引号转义掉，导致后面的参数全部丢失。 -->
+    <SrcRootArg>$(MSBuildThisFileDirectory).</SrcRootArg>
+    <GenRootArg>$(MSBuildThisFileDirectory)..\build\$(OutputFolderName)\gen</GenRootArg>
+    <GenRoot>$(MSBuildThisFileDirectory)..\build\$(OutputFolderName)\gen</GenRoot>
+    <OutputPath>$(MSBuildThisFileDirectory)..\dist\$(OutputFolderName)\</OutputPath>
+
+    <!-- 平台条件编译符号：注意这里 **不** 定义 BLM_ACAD -->
+    <DefineConstants>$(DefineConstants);BLM_$(CadPlatform.ToUpperInvariant())</DefineConstants>
+  </PropertyGroup>
+
+  <!-- 编译前先把共享源码转换成目标平台的命名空间。
+       注意：Compile 项必须放在目标内部、 Exec 之后添加——
+       顶层的 ItemGroup 在项目求值时就展开了，那时候生成目录还是空的，
+       会编译出一个什么都没有的空 DLL。 -->
+  <Target Name="GeneratePlatformSource" BeforeTargets="BeforeBuild;CoreCompile">
+    <Exec Command="powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(ToolsRoot)gen-platform-src.ps1&quot; -SrcDir &quot;$(SrcRootArg)&quot; -OutDir &quot;$(GenRootArg)&quot; -NamespaceRoot &quot;$(CadNamespace)&quot; -Platform &quot;$(CadPlatform)&quot;"
+          ConsoleToMSBuild="true"
+          ContinueOnError="false" />
+    <ItemGroup>
+      <Compile Include="$(GenRoot)\**\*.cs" Link="%(RecursiveDir)%(Filename)%(Extension)" />
+    </ItemGroup>
+  </Target>
+
+  <!-- 目标 CAD 的托管程序集引用。文件名由各 csproj 的 CadRefItems 指定，
+       全部 Copy Local = false（插件 DLL 不能把宿主的 DLL 拷到输出目录）。 -->
+  <ItemGroup Condition="'$(CadRefDir)' != ''">
+    <CadRefFile Include="$(CadRefItems)" />
+    <!-- ExtraCadRefItems：可选的补充程序集（中望把 AutoCAD 的 acmgd 内容
+         合并进了 ZwManaged，个别机器上如果还单独提供文件，可用这个属性追加：
+         dotnet build ... -p:ExtraCadRefItems=ZwManagedUx -->
+    <CadRefFile Include="$(ExtraCadRefItems)" Condition="'$(ExtraCadRefItems)' != ''" />
+    <!-- 用 transform 把文件名展开成 HintPath 完整路径直接作为 Include 的 spec，
+         避免 %(xxx.Identity) 这种写法在项元数据里不生效的问题。 -->
+    <Reference Include="@(CadRefFile->'$(CadRefDir)\%(Identity).dll')"
+               Private="false"
+               EmbedInteropTypes="false" />
+  </ItemGroup>
+
+  <!-- WinForms / GDI+ 引用 -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net8.0-windows'">
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>false</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' != 'net8.0-windows'">
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+  </ItemGroup>
+
+  <!-- 老版本 .NET Framework 的引用程序集 -->
+  <ItemGroup Condition="'$(TargetFramework)' != 'net8.0-windows'">
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
+  </ItemGroup>
+
+  <!-- 找不到目标 CAD 程序集时直接报错终止。
+       之前的版本只给一条 Message 提示然后继续，结果在没装国产 CAD 的机器上
+       编译出一个引用了"参考程序集"的 DLL，拿到真机上 NETLOAD 时报
+       "未能加载文件或程序集 ZwManagedUx / GcMgd..."——这类无效 DLL 已造成过
+       一次误用，所以这里必须 fail fast。 -->
+  <Target Name="FailOnMissingCadRefs" BeforeTargets="GeneratePlatformSource">
+    <Error Condition="'$(CadRefDir)' == '' Or !Exists('$(CadRefDir)\$(CadFirstRef).dll')"
+           Text="未找到 $(CadPlatform) 的托管程序集 '$(CadFirstRef).dll'（查找目录：'$(CadRefDir)'）。请在装有 $(CadPlatform) 的机器上编译，并指定安装目录：dotnet build ... -p:CadRefDir=&quot;$(CadPlatform) 安装目录&quot;。详见 README 第 5 节。" />
+  </Target>
+
+  <!-- 用"参考程序集"（tools\refstub，本机验证编译专用）编译出的产物，
+       在程序集说明里打上 VERIFY-ONLY 标记，资源管理器文件属性里可见，
+       避免与真机产物混淆。 -->
+  <ItemGroup Condition="$(CadRefDir.Contains('refstub'))">
+    <AssemblyAttribute Include="System.Reflection.AssemblyDescriptionAttribute">
+      <_Parameter1>VERIFY-ONLY —— 用参考程序集编译的验证产物，不能在目标 CAD 上加载，请在装有 CAD 的机器上重新编译</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>

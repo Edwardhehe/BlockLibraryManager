@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    浩辰 CAD（GstarCAD）版本
+      命名空间根   Gssoft.Gscad.*（官方迁移指南：把 Autodesk.AutoCAD 直接换成 Gssoft.Gscad）
+      托管程序集   GcCoreMgd.dll / GcDbMgd.dll / GcMgd.dll（位于安装目录或 SDK 的 arx\inc）
+      目标框架     .NET Framework 4.8（官方 PDF 明确要求）
+      已参考       GstarCAD 2024 .NET Programming Guide / Migration Guide
+
+    编译（必须在装有浩辰 CAD 或其 GRX SDK 的机器上）：
+      build-gstarcad.cmd
+      或手工：
+      dotnet build build\GstarCAD\BlockLibraryManager.csproj -c Release ^
+              -p:CadRefDir="C:\Program Files\Gstarsoft\GstarCAD 2024"
+  -->
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputFolderName>GstarCAD</OutputFolderName>
+    <AssemblyTitle>图库管理器 (浩辰 CAD)</AssemblyTitle>
+    <CadPlatform>GstarCAD</CadPlatform>
+    <CadNamespace>Gssoft.Gscad</CadNamespace>
+    <CadRefDir Condition="'$(CadRefDir)' == ''">C:\Program Files\Gstarsoft\GstarCAD 2024</CadRefDir>
+    <CadRefItems>GcCoreMgd;GcDbMgd;GcMgd</CadRefItems>
+    <CadFirstRef>GcDbMgd</CadFirstRef>
+    <DefineConstants>$(DefineConstants);GSTARCAD_COMPAT</DefineConstants>
+  </PropertyGroup>
+
+  <Import Project="..\..\src\Common.CadPlatform.props" />
+
+</Project>

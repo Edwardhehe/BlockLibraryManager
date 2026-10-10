@@ -1,0 +1,28 @@
+# 编译中间产物与输出
+[Bb]in/
+[Oo]bj/
+dist/
+*.user
+*.suo
+*.pdb
+.vs/
+.idea/
+
+# 国产 CAD 编译时生成的替换源码
+build/**/gen/
+
+# 厂商托管程序集与 NuGet 包（版权属于中望 / 浩辰，不能再分发）
+tools/zwapi/
+tools/gcapi/
+tools/refstub/
+tools/ilretarget/
+
+# 本地历史快照与打包脚本（含本机路径）
+snapshots/
+pack.py
+*.zip
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store

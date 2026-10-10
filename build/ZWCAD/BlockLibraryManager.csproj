@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    中望 CAD（ZWCAD）版本
+      命名空间根   ZwSoft.ZwCAD.*
+      托管程序集   ZwDatabaseMgd.dll / ZwManaged.dll（位于 ZWCAD 安装目录）
+      目标框架     .NET Framework 4.7
+      已验证版本   ZWCAD 2020 / 2021（官方 KB 要求 net47）
+
+    编译（必须在装有中望 CAD 的机器上，或用 ZRX SDK 的 inc 目录）：
+      build-zwcad.cmd
+      或手工：
+      dotnet build build\ZWCAD\BlockLibraryManager.csproj -c Release ^
+              -p:CadRefDir="C:\Program Files\ZWSOFT\ZWCAD 2021"
+  -->
+  <PropertyGroup>
+    <TargetFramework>net47</TargetFramework>
+    <OutputFolderName>ZWCAD</OutputFolderName>
+    <AssemblyTitle>图库管理器 (中望 CAD)</AssemblyTitle>
+    <CadPlatform>ZWCAD</CadPlatform>
+    <CadNamespace>ZwSoft.ZwCAD</CadNamespace>
+    <CadRefDir Condition="'$(CadRefDir)' == ''">C:\Program Files\ZWSOFT\ZWCAD 2021</CadRefDir>
+    <CadRefItems>ZwDatabaseMgd;ZwManaged</CadRefItems>
+    <CadFirstRef>ZwDatabaseMgd</CadFirstRef>
+    <DefineConstants>$(DefineConstants);ZWCAD_COMPAT</DefineConstants>
+  </PropertyGroup>
+
+  <Import Project="..\..\src\Common.CadPlatform.props" />
+
+</Project>

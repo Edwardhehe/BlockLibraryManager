@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- AutoCAD 2012  =>  .NET Framework 4.0（2012 还没有 accoremgd.dll） -->
+  <PropertyGroup>
+    <TargetFramework>net40</TargetFramework>
+    <OutputFolderName>CAD2012</OutputFolderName>
+    <AssemblyTitle>图库管理器 (AutoCAD 2012)</AssemblyTitle>
+    <AcadRefDir Condition="'$(AcadRefDir)' == ''">C:\Program Files\Autodesk\AutoCAD 2012</AcadRefDir>
+    <UseAccoreMgd>false</UseAccoreMgd>
+    <DefineConstants>$(DefineConstants);ACAD_2012_OR_OLDER</DefineConstants>
+  </PropertyGroup>
+
+  <Import Project="..\..\src\Common.props" />
+
+</Project>
