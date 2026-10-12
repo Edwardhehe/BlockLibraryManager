@@ -6,11 +6,13 @@ using System.Reflection.Emit;
 namespace BlockLibraryManager
 {
     /// <summary>
-    /// 宿主 CAD 平台适配层（AutoCAD / 中望 CAD / 浩辰 CAD 三合一）。
+    /// 宿主 CAD 平台适配层（AutoCAD / 中望 CAD / 浩辰 CAD / BricsCAD 四合一）。
     ///
     /// 背景：中望 CAD（ZwSoft.ZwCAD.*）与浩辰 CAD（Gssoft.Gscad.*）的 .NET API
     /// 是 ObjectARX 的移植版，绝大多数类型与 AutoCAD 同名同签名，直接替换命名空间
-    /// 即可编译。但有极少数成员各家实现情况不一致，例如：
+    /// 即可编译。BricsCAD 也是移植版，但命名空间被拆成 Bricscad.*（BrxMgd.dll）
+    /// 与 Teigha.*（TD_Mgd.dll）两个根，由 tools\gen-platform-src.ps1 的映射表处理。
+    /// 有极少数成员各家实现情况不一致，例如：
     ///   Application.ShowModelessDialog / ShowModalDialog
     ///   Document.CommandEnded / CommandCancelled / UnknownCommand
     /// 如果在国产平台上像 AutoCAD 那样直接写这些成员，一旦对方版本没有实现，
@@ -48,6 +50,8 @@ namespace BlockLibraryManager
                 return "ZWCAD";
 #elif BLM_GSTARCAD
                 return "GstarCAD";
+#elif BLM_BRICSCAD
+                return "BricsCAD";
 #else
                 return "AutoCAD";
 #endif

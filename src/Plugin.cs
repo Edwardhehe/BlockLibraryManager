@@ -31,6 +31,18 @@ namespace BlockLibraryManager
 
             try
             {
+                // 中望 / 浩辰：把自己登记进"随 CAD 启动自动加载"的 HKCU 注册表。
+                // 用户手动加载一次后，以后重启 CAD 不再需要 netload / APPLOAD。
+                // AutoCAD / BricsCAD 上是空方法（前者走 bundle 自动加载）。
+                AutoLoadRegister.EnsureRegistered();
+            }
+            catch
+            {
+                // 登记失败只影响"下次自动加载"，不影响本次使用
+            }
+
+            try
+            {
                 Autodesk.AutoCAD.ApplicationServices.Document doc =
                     Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
 

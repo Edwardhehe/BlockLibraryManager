@@ -35,15 +35,11 @@ namespace BlockLibraryManager
     {
         private readonly LibraryConfig _config;
 
-        private readonly Queue<BlockItem> _pending = new Queue<BlockItem>();
+        // 这个队列不能是 readonly —— Prioritize() 会整体重排它
+        //（数据虚拟化：把屏幕上看得见的条目挪到队首优先出图）。
+        private Queue<BlockItem> _pending = new Queue<BlockItem>();
         private readonly HashSet<string> _pendingKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        /// <summary>
-        /// 缺少磁盘缓存、需要真正打开 DWG 生成的条目。
-        /// ProcessQueue 先把所有"已有缓存"的条目快速加载完（纯 PNG 解码），
-        /// 再回来逐个处理这里慢速的生成任务，保证列表先把画面填满、流畅不卡。
-        /// </summary>
-        private readonly Queue<BlockItem> _generate = new Queue<BlockItem>();
         private readonly Dictionary<string, Image> _memoryCache =
             new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
 
@@ -53,9 +49,9 @@ namespace BlockLibraryManager
         /// 为什么需要上限：图库动辄上千个 DWG，每张缩略图是一个 Bitmap，
         /// 无上限缓存会让内存随浏览量一直涨。超过上限时淘汰最久未用的一批。
         ///
-        /// 为什么淘汰时**不 Dispose**：缓存里的图会被 CreateDisplayImage 直接
-        /// 交给 ImageList 使用（ImageList 内部持有原对象引用），一旦在这里
-        /// Dispose，界面重绘时就会抛"参数无效"——这正是历史崩溃的根源。
+        /// 为什么淘汰时**不 Dispose**：缓存里的图会被列表的自绘代码直接拿去
+        /// DrawImage（自绘之后不再经过 ImageList），如果在这里 Dispose，
+        /// 一次还没画完的重绘就会抛"参数无效"——这正是历史崩溃的根源。
         /// 只解除引用、交给 GC 回收，是最安全的做法。
         /// </summary>
         private readonly List<string> _cacheOrder = new List<string>();
@@ -66,6 +62,65 @@ namespace BlockLibraryManager
         private Image _placeholderWhole;
         private Image _placeholderInner;
         private bool _disposed;
+
+        /// <summary>
+        /// 是否已暂停。面板关闭（隐藏）或最小化时置位：
+        /// 此时队列会立刻清空、后续登记与处理全部停止，
+        /// 后台不再占用 AutoCAD 主线程去开 DWG——这正是"关掉面板后 CAD 变卡"的根源。
+        /// </summary>
+        private volatile bool _suspended;
+
+        /// <summary>
+        /// 生成失败记账：key → 本会话内已失败的次数。
+        /// 失败的条目在内存缓存里存的是 null（见 PutCache），
+        /// 重新排队时靠这个账本防止对真坏文件无限重试。
+        /// Resume（面板重新可见）时清零，给失败过的条目新一轮机会。
+        /// </summary>
+        private readonly Dictionary<string, int> _failCounts = new Dictionary<string, int>();
+
+        /// <summary>元数据（动态块/可见性）检测失败记账：key = 条目 Key。</summary>
+        private readonly Dictionary<string, int> _metaFails = new Dictionary<string, int>();
+
+        /// <summary>同一会话内元数据检测的最大自动重试次数。
+        /// 检测失败的文件不会落盘任何标记，若不记账，每次可见区间变化都会
+        /// 重新排队 → 再次 ReadDwgFile 打开 Database → 再次失败，无限循环。</summary>
+        private const int MaxMetaRetry = 3;
+
+        /// <summary>同一会话内允许自动重试的最大次数，超过就不再排队（等下次 Resume 清零）。</summary>
+        private const int MaxAutoRetry = 3;
+
+        // ---- 并行解码层 ----
+        //
+        // 以前所有出图工作（读磁盘缓存、打开 DWG 取预览）都压在 AutoCAD 主线程上，
+        // 只能靠 Application.Idle 一批批挤 40ms。现在只有真正需要 Database 的活
+        // 才留在主线程，其余全部丢给线程池并行跑。
+
+        /// <summary>后台线程的产出（线程间交接，取用前必须加锁）。</summary>
+        private readonly List<KeyValuePair<BlockItem, Image>> _done =
+            new List<KeyValuePair<BlockItem, Image>>();
+
+        private readonly object _doneLock = new object();
+
+        /// <summary>正在后台跑的任务数（Interlocked 维护）。</summary>
+        private int _workers;
+
+        /// <summary>并行上限。IO + 解码为主，CPU 不是瓶颈，给到 8 已经能吃满磁盘。</summary>
+        private const int MaxWorkers = 8;
+
+        /// <summary>
+        /// 后台取不到内嵌预览、必须打开 Database 才能出图的条目（主线程做，慢）。
+        /// 典型：THUMBSAVE=0 存的图、R13 以前的图、第三方工具生成的图。
+        /// </summary>
+        private Queue<BlockItem> _fallback = new Queue<BlockItem>();
+        private readonly HashSet<string> _fallbackKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// 只差"动态块 / 可见性状态"元数据的条目（主线程做，低优先级）。
+        /// 缩略图本身已经从内嵌预览拿到了，只有屏幕上看得见的那些才需要补这个角标，
+        /// 所以这一路只对可见项排队，避免为上千个用不上的文件白开 Database。
+        /// </summary>
+        private Queue<BlockItem> _meta = new Queue<BlockItem>();
+        private readonly HashSet<string> _metaKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// 动态块标记缓存：key = 图块条目 Key，value = 是否含动态块定义。
@@ -126,18 +181,92 @@ namespace BlockLibraryManager
         /// 把上百个 PNG 读进来解码，是打开面板卡顿的头号原因；
         /// 现在只登记，真正的读缓存 / 生成统统推迟到 ProcessQueue（空闲时小批量做）。
         /// </summary>
+        /// <summary>
+        /// 暂停后台工作：清空待处理队列，之后不再登记、不再处理。
+        /// 已生成好的内存缓存保留，下次打开面板立刻能用。
+        /// </summary>
+        public void Suspend()
+        {
+            _suspended = true;
+            CancelPending();
+        }
+
+        /// <summary>恢复后台工作（面板重新可见时调用）。</summary>
+        public void Resume()
+        {
+            _suspended = false;
+
+            // 给上一轮生成失败的条目（缓存 null、显示占位图的那批）新一轮机会：
+            // 清空失败账本，Resume 后调用方会重新 RequestThumbnails，它们会再次排队。
+            // 不清零的话，一次偶发失败（CAD 忙 / 文件被占）就永远停留在"DWG"占位图。
+            _failCounts.Clear();
+            _metaFails.Clear();
+        }
+
+        /// <summary>内存缓存里是否有**可用的**缩略图（存在且非 null）。
+        /// 缓存值为 null 表示生成失败，不算数 —— 允许重新排队重试。</summary>
+        private bool HasUsableCache(string key)
+        {
+            Image img;
+            return key != null && _memoryCache.TryGetValue(key, out img) && img != null;
+        }
+
+        /// <summary>当前是否处于暂停状态。</summary>
+        public bool IsSuspended
+        {
+            get { return _suspended; }
+        }
+
+        /// <summary>
+        /// 丢弃全部待处理条目（各个队列 + 去重集合）。
+        /// 只丢"任务"，不丢已经生成好的缩略图缓存。
+        ///
+        /// 已经在后台跑着的任务拦不住（ThreadPool 上的工作项撤不回来），
+        /// 但它们最多再跑几毫秒，且产出会在下一次 Resume 前一直躺在 _done 里。
+        /// </summary>
+        public void CancelPending()
+        {
+            _pending.Clear();
+            _pendingKeys.Clear();
+            _fallback.Clear();
+            _fallbackKeys.Clear();
+            _meta.Clear();
+            _metaKeys.Clear();
+
+            lock (_doneLock)
+            {
+                _done.Clear();
+            }
+        }
+
         public int RequestThumbnails(IEnumerable<BlockItem> items)
         {
             if (items == null) return 0;
+
+            // 面板不可见时一律不登记：看不见的东西没必要在后台生成，
+            // 否则队列会在隐藏期间越攒越多，白白拖慢 AutoCAD。
+            if (_suspended) return 0;
 
             int added = 0;
 
             foreach (BlockItem item in items)
             {
                 if (item == null) continue;
-                if (_memoryCache.ContainsKey(item.Key)) continue;
+                // 只跳过"缓存里真有一张图"的；缓存为 null（上次生成失败）的重新排队重试
+                if (HasUsableCache(item.Key)) continue;
                 if (_pendingKeys.Contains(item.Key)) continue;
+
+                // 已经在"开 Database 兜底"队列里的不能再进并行队列：
+                // 两条队列同时为同一个文件出图，会各自 SavePng 到同一个路径
+                // （共用 path.tmp），File.Move 互相踩；而且完成时 RaiseReady 会被
+                // 触发两次，界面计数双算、进度条提前收尾。
+                if (_fallbackKeys.Contains(item.Key)) continue;
+
                 if (!item.IsWholeDrawing) continue;      // 内部块没有独立预览图
+
+                // 失败太多次的本会话不再自动重试，防止对真坏文件无限开 Database
+                int fails;
+                if (_failCounts.TryGetValue(item.Key, out fails) && fails >= MaxAutoRetry) continue;
 
                 _pendingKeys.Add(item.Key);
                 _pending.Enqueue(item);
@@ -148,76 +277,418 @@ namespace BlockLibraryManager
         }
 
         /// <summary>
-        /// 处理队列中的若干条目。由 Application.Idle 事件驱动。
-        /// 每批最多占用 ~40ms，宁可多跑几次也不让界面卡住。
+        /// 数据虚拟化：把一批条目（调用方传的是"当前屏幕上看得见的那些"）挪到队列最前面，
+        /// 让看得见的先出图。用户滚动后调用方会重算可见区间再调一次，于是队列始终
+        /// 跟着视口走——这才是"只为可见项加载图片"在后台队列侧的那一半。
         ///
-        /// 两阶段策略（保证"已有缩略图跳过、加载丝滑"）：
-        ///   阶段一：把有磁盘缓存的条目全部直接读进来（纯 PNG 解码，一张不到 1ms），
-        ///           没有缓存的先挪进 _generate 暂不处理——列表因此最先被填满；
-        ///   阶段二：缓存全读完后，再逐个打开 DWG 生成缺失的缩略图。
-        /// 返回 true 表示队列仍未处理完，需要继续。
+        /// 代价 O(n)（n = 队列长度），所以调用方只在可见区间真的变化时才调用，
+        /// 不会每帧都重排。
+        /// </summary>
+        public void Prioritize(System.Collections.Generic.ICollection<BlockItem> first)
+        {
+            if (_suspended) return;
+            if (first == null || first.Count == 0) return;
+
+            // 缩略图可以从内嵌预览直接取，但"是否动态块 / 有没有可见性状态"必须打开
+            // 图纸才知道。只为屏幕上看得见的这几项排一次队——角标本来就只在可见项上画，
+            // 看不见的那些根本用不上，没必要为它们开 Database。
+            //
+            // 注意这段必须放在下面的"队列为空就返回"之前：所有缩略图都出完之后
+            // _pending / _fallback 都是空的，但用户滚动到新的可见项时仍然要补测元数据。
+            foreach (BlockItem item in first)
+            {
+                if (item == null || string.IsNullOrEmpty(item.FilePath)) continue;
+                if (!item.IsWholeDrawing) continue;              // 内部块没有独立 DWG
+                if (_metaKeys.Contains(item.Key)) continue;       // 已在队列里
+                if (HasDynamicMeta(item.FilePath)) continue;      // 磁盘上已有检测结论
+
+                // 检测反复失败的（DWG 损坏 / 被占用 / 标记写不进盘）不再重开 Database，
+                // 否则用户每滚一次列表就对这些文件重读一遍，永远停不下来。
+                int metaFails;
+                if (_metaFails.TryGetValue(item.Key, out metaFails) && metaFails >= MaxMetaRetry) continue;
+
+                _metaKeys.Add(item.Key);
+                _meta.Enqueue(item);
+            }
+
+            if (_pending.Count == 0 && _fallback.Count == 0) return;
+
+            HashSet<string> front = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (BlockItem item in first)
+            {
+                if (item != null && !string.IsNullOrEmpty(item.Key))
+                    front.Add(item.Key);
+            }
+            if (front.Count == 0) return;
+
+            _pending = Reorder(_pending, front);
+            _fallback = Reorder(_fallback, front);
+        }
+
+        /// <summary>把队列中命中 front 的条目提到前面，其余保持原相对顺序。</summary>
+        private static Queue<BlockItem> Reorder(Queue<BlockItem> source, HashSet<string> front)
+        {
+            if (source == null || source.Count == 0) return source;
+
+            List<BlockItem> head = new List<BlockItem>(front.Count);
+            List<BlockItem> tail = new List<BlockItem>(source.Count);
+
+            foreach (BlockItem item in source)
+            {
+                if (item != null && front.Contains(item.Key)) head.Add(item);
+                else tail.Add(item);
+            }
+
+            if (head.Count == 0) return source;     // 没有交集，原样返回避免无谓分配
+
+            Queue<BlockItem> result = new Queue<BlockItem>(source.Count);
+            foreach (BlockItem item in head) result.Enqueue(item);
+            foreach (BlockItem item in tail) result.Enqueue(item);
+            return result;
+        }
+
+        /// <summary>
+        /// 处理队列中的若干条目。由 Application.Idle 事件驱动。
+        ///
+        /// 【调度策略】把活按"要不要碰 CAD Database"分成两类：
+        ///   · 不碰 Database 的（读磁盘缓存 PNG、直读 DWG 内嵌预览、缩放、裁黑边、落盘）
+        ///     → 全部丢给线程池并行跑，最多 MaxWorkers 路。主线程一个字节都不读。
+        ///   · 必须碰 Database 的（没有内嵌预览时的线框兜底、动态块 / 可见性状态检测）
+        ///     → 留在主线程，并且受 40ms 时间预算约束。
+        ///
+        /// 于是主线程在 ProcessQueue 里只干两件极便宜的事：
+        /// 派活、收活。真正耗时的解码全线并行，AutoCAD 界面不再被出图拖住。
+        /// 返回 true 表示还有活没干完，需要继续。
         /// </summary>
         public bool ProcessQueue(int maxItems)
         {
+            // 暂停期间一滴活都不干：直接清空队列并返回 false，
+            // 让空闲循环彻底空转，AutoCAD 主线程不被占。
+            if (_suspended)
+            {
+                CancelPending();
+                return false;
+            }
+
             if (maxItems <= 0) maxItems = 1;
 
-            int count = 0;
             int startTick = Environment.TickCount;
 
-            // ---- 阶段一：快速读磁盘缓存 ----
-            while (count < maxItems && _pending.Count > 0)
+            // ---- 收活：把后台已经做完的缩略图搬进缓存（极便宜，纯字典操作）----
+            DrainDone();
+
+            // ---- 派活：把等待中的条目投进线程池，直到占满并行额度 ----
+            while (_pending.Count > 0 && _workers < MaxWorkers)
+            {
+                BlockItem item = _pending.Dequeue();
+                _pendingKeys.Remove(item.Key);
+
+                // 排队后缓存被别的路径补上了：跳过派活，但同样要通知一次
+                //（本轮 total 把它算进去了，静默跳过会让进度永远差一条）。
+                if (HasUsableCache(item.Key))
+                {
+                    RaiseReady(item);
+                    continue;
+                }
+
+                DispatchQuick(item);
+            }
+
+            // ---- 主线程：只有必须打开 DWG 的活才在这里做 ----
+            int count = 0;
+
+            // 兜底出图：内嵌预览取不到，只能打开 Database 自绘线框
+            while (count < maxItems && _fallback.Count > 0)
             {
                 // 时间预算：到点就收工，剩下的等下一次 Idle，界面永远能响应
                 if (count > 0 && Environment.TickCount - startTick > 40) break;
 
-                BlockItem item = _pending.Dequeue();
-                _pendingKeys.Remove(item.Key);
+                BlockItem item = _fallback.Dequeue();
+                _fallbackKeys.Remove(item.Key);
 
-                if (_memoryCache.ContainsKey(item.Key)) continue;
-
-                if (HasDiskCache(item))
+                // 同理：已有真图就通知一次再跳过，保证本轮计数闭合
+                if (HasUsableCache(item.Key))
                 {
-                    Image cached = TryLoadCached(item);
-                    if (cached != null)
-                    {
-                        PutCache(item.Key, cached);
-                        RaiseReady(item);
-                        count++;
-                        continue;
-                    }
+                    RaiseReady(item);
+                    continue;
                 }
 
-                // 没有缓存 → 进入慢速生成队列
-                _generate.Enqueue(item);
-            }
-
-            // ---- 阶段二：生成缺失的缩略图（打开 DWG，较慢） ----
-            if (_pending.Count == 0)
-            {
-                while (count < maxItems && _generate.Count > 0)
+                // 兜底出图整段包住：万一 CAD API 抛出未预期异常，
+                // 也必须写失败缓存（记账）+ 通知（闭合计数），否则这个条目
+                // 不在任何账本里，查漏补缺会每 2 秒把它重新排队一遍——
+                // 表现就是右下角"缩略图 x/y"的进度条永远在闪（v1.49.1 修）。
+                try
                 {
-                    // 生成单条耗时不稳定，同样受总时间预算约束
-                    if (count > 0 && Environment.TickCount - startTick > 40) break;
-
-                    BlockItem item = _generate.Dequeue();
-
-                    if (_memoryCache.ContainsKey(item.Key)) continue;
-
-                    // 双保险：阶段一之后缓存可能又被别的路径补上了，先查一次（一次 File.Exists，代价极小）
-                    Image image = TryLoadCached(item);
-                    if (image == null) image = CreateThumbnail(item);   // 优先用 DWG 内嵌预览位图
+                    Image image = GenerateFromDatabase(item);
 
                     // 生成失败时缓存 null，而不是共享的占位图单例——
                     // 占位图是全局唯一实例，一旦进了缓存就可能被 Dispose，
                     // 之后再拿它去绘制就会抛"参数无效"。GetThumbnail 遇到 null 会自动回退到占位图。
                     PutCache(item.Key, image);
-                    RaiseReady(item);
-
-                    count++;
                 }
+                catch (System.Exception)
+                {
+                    PutCache(item.Key, null);
+                }
+                RaiseReady(item);
+
+                count++;
             }
 
-            return _pending.Count > 0 || _generate.Count > 0;
+            // 元数据补测：只为屏幕上看得见的条目做（⚡ 角标 / ◀▶ 切换要用）
+            while (count < maxItems && _meta.Count > 0)
+            {
+                if (count > 0 && Environment.TickCount - startTick > 40) break;
+
+                BlockItem item = _meta.Dequeue();
+                if (item == null) continue;
+                _metaKeys.Remove(item.Key);
+
+                // 同兜底出图：检测全程包住，任何异常都不能让本轮的通知丢失，
+                // 否则进度计数差一条、查漏还会把它一遍遍重排（v1.49.1 修）。
+                try
+                {
+                    DetectMetadata(item);
+
+                    // 检测成功的会落盘 .dyn / .nodyn 标记；什么都没落盘说明这次失败了
+                    //（DWG 打不开 / 文件被占用）。记一笔账，累计到上限后 Prioritize
+                    // 不再为它排队——否则每次可见区间变化都会重开一次 Database。
+                    if (!HasDynamicMeta(item.FilePath))
+                    {
+                        int metaFails;
+                        _metaFails.TryGetValue(item.Key, out metaFails);
+                        _metaFails[item.Key] = metaFails + 1;
+                    }
+                    else
+                    {
+                        _metaFails.Remove(item.Key);   // 成功落盘就销账
+                    }
+                }
+                catch (System.Exception)
+                {
+                    int metaFails;
+                    _metaFails.TryGetValue(item.Key, out metaFails);
+                    _metaFails[item.Key] = metaFails + 1;
+                }
+
+                RaiseReady(item);
+
+                count++;
+            }
+
+            return PendingCount > 0;
+        }
+
+        // ---------------- 并行出图 ----------------
+
+        /// <summary>
+        /// 把一个条目投进线程池。后台线程里只做纯文件 IO + GDI+ 图像处理，
+        /// 绝不涉及 AutoCAD 的任何 API（Database 只能在主线程调用）。
+        /// </summary>
+        private void DispatchQuick(BlockItem item)
+        {
+            System.Threading.Interlocked.Increment(ref _workers);
+
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate(object state)
+            {
+                BlockItem it = (BlockItem)state;
+                Image image = null;
+
+                try
+                {
+                    // 服务已 Dispose（面板销毁 / 插件卸载）时不再出图：
+                    // 结果塞进 _done 也不会再有人来 DrainDone，那张 Bitmap 就泄漏了。
+                    if (!_suspended && !_disposed) image = LoadOrExtract(it);
+                }
+                catch
+                {
+                    image = null;
+                }
+                finally
+                {
+                    if (_disposed && image != null)
+                    {
+                        try { image.Dispose(); } catch { }
+                        image = null;
+                    }
+
+                    lock (_doneLock)
+                    {
+                        _done.Add(new KeyValuePair<BlockItem, Image>(it, image));
+                    }
+                    System.Threading.Interlocked.Decrement(ref _workers);
+                }
+            }, item);
+        }
+
+        /// <summary>
+        /// 后台线程上的出图主流程：先找磁盘缓存，再直读 DWG 内嵌预览。
+        /// 返回 null 表示这条路走不通，需要主线程打开 Database 兜底。
+        /// </summary>
+        private Image LoadOrExtract(BlockItem item)
+        {
+            if (item == null || string.IsNullOrEmpty(item.FilePath)) return null;
+            if (!File.Exists(item.FilePath)) return null;
+
+            // 1) 上次已经生成过 → 磁盘缓存（纯 PNG 解码）
+            Image cached = TryLoadCached(item);
+            if (cached != null) return cached;
+
+            // 2) 直读 DWG 里内嵌的预览图：不打开 Database，只读预览段那几十 KB
+            using (Bitmap raw = DwgPreviewReader.TryRead(item.FilePath))
+            {
+                if (raw == null) return null;
+                return BuildThumbnail(raw, item.FilePath);
+            }
+        }
+
+        /// <summary>
+        /// 把内嵌预览图加工成最终缩略图：降采样 → 裁右侧黑边 → 换底色 → 适配画布 → 落盘。
+        /// 全是 GDI+ 位图运算，与 CAD 无关，所以可以在后台线程跑。
+        /// </summary>
+        private Image BuildThumbnail(Bitmap raw, string dwgPath)
+        {
+            int size = _config.ThumbSize;
+            if (size < 48) size = 48;
+
+            // 【降采样前置】内嵌预览动辄 512×512 甚至更大，而裁黑边和换底色都是
+            // 逐像素处理，按原尺寸跑是整条链路上最贵的一段。先缩到 2 倍缩略图尺寸。
+            using (Bitmap small = ResampleWithin(raw, size * 2))
+            {
+                if (small == null) return null;
+
+                using (Bitmap trimmed = TrimRightBlackBand(small))
+                using (Bitmap modeApplied = ApplyBackgroundMode(trimmed))
+                {
+                    Image fitted = FitToCanvas(modeApplied, size, size,
+                        WhiteBackground ? Color.White : Color.Black);
+
+                    SavePng(fitted, GetCachePath(dwgPath));
+                    return fitted;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 把后台做好的缩略图收进内存缓存并通知界面。
+        /// 在主线程执行，所以不必加锁访问 _memoryCache。
+        /// 取不到图的条目转进 _fallback，等主线程打开 Database 兜底。
+        /// </summary>
+        private void DrainDone()
+        {
+            KeyValuePair<BlockItem, Image>[] batch;
+
+            lock (_doneLock)
+            {
+                if (_done.Count == 0) return;
+                batch = _done.ToArray();
+                _done.Clear();
+            }
+
+            foreach (KeyValuePair<BlockItem, Image> pair in batch)
+            {
+                BlockItem item = pair.Key;
+                if (item == null) continue;
+
+                if (pair.Value != null)
+                {
+                    // 只跳过"已有一张真图"的；缓存为 null（上次失败）的重试成果必须收下。
+                    // 即便跳过也要 RaiseReady：调用方按 RaiseReady 计数闭合本轮进度，
+                    // 静默 continue 会让进度条永远停在差一点的位置（例：568/599）。
+                    if (HasUsableCache(item.Key))
+                    {
+                        RaiseReady(item);
+                        continue;
+                    }
+                    PutCache(item.Key, pair.Value);
+                    RaiseReady(item);
+                    continue;
+                }
+
+                // 内嵌预览这条路没走通 → 交给主线程兜底。
+                if (HasUsableCache(item.Key))
+                {
+                    RaiseReady(item);
+                    continue;
+                }
+                if (_fallbackKeys.Contains(item.Key))
+                {
+                    // 已经排在兜底队列里等主线程处理，处理完自会通知。
+                    // 但本轮 total 把它算进去了，这里也得先通知一次，否则
+                    // RaiseReady 计数差一条、进度条收不了尾（v1.48.1 同类问题）。
+                    RaiseReady(item);
+                    continue;
+                }
+
+                int fails;
+                if (_failCounts.TryGetValue(item.Key, out fails) && fails >= MaxAutoRetry)
+                {
+                    // 重试次数用尽：不再排兜底队列，但必须通知一次——
+                    // 否则本轮的"已生成计数"永远差这一条，进度条收不了尾。
+                    RaiseReady(item);
+                    continue;
+                }
+
+                _fallbackKeys.Add(item.Key);
+                _fallback.Enqueue(item);
+            }
+        }
+
+        /// <summary>
+        /// 补测动态块 / 可见性状态元数据。需要打开 Database，只在主线程调用。
+        /// 结果会落盘成标记文件，下次启动直接读标记，不用再开一次图纸。
+        /// </summary>
+        private void DetectMetadata(BlockItem item)
+        {
+            if (item == null || string.IsNullOrEmpty(item.FilePath)) return;
+            if (!File.Exists(item.FilePath)) return;
+            if (_disposed) return;
+
+            Autodesk.AutoCAD.DatabaseServices.Database db = null;
+
+            try
+            {
+                db = new Autodesk.AutoCAD.DatabaseServices.Database(false, true);
+                db.ReadDwgFile(item.FilePath,
+                    Autodesk.AutoCAD.DatabaseServices.FileOpenMode.OpenForReadAndReadShare,
+                    false, string.Empty);
+
+                bool dyn = DetectDynamicBlock(db);
+                _dynamicFlags[item.Key] = dyn;
+
+                if (dyn)
+                {
+                    WriteDynamicMarker(item.FilePath);
+                    RemovePlainMarker(item.FilePath);
+
+                    // 可见性状态要靠导出 DXF 文本再解析，很贵，只对真动态块做
+                    List<string> visStates = DetectVisibilityStateNames(item.Key, db);
+                    _visStates[item.Key] = visStates ?? new List<string>();
+
+                    if (visStates != null && visStates.Count >= 2)
+                        WriteVisibilityMarker(item.FilePath, visStates);
+                    else
+                        WriteEmptyVisibilityMarker(item.FilePath);   // 落盘"已检测、无可见性"
+                }
+                else
+                {
+                    // 落盘"已检测、非动态块"，下次直接读标记，省掉一次 ReadDwgFile
+                    WritePlainMarker(item.FilePath);
+                    _visStates[item.Key] = new List<string>();
+                }
+            }
+            catch
+            {
+                // 元数据检测失败只影响角标，不影响缩略图
+            }
+            finally
+            {
+                if (db != null)
+                {
+                    try { db.CloseInput(true); } catch { }
+                    try { db.Dispose(); } catch { }
+                }
+            }
         }
 
         /// <summary>该图块是否已有磁盘缓存 PNG。有则直接跳过生成。</summary>
@@ -228,9 +699,34 @@ namespace BlockLibraryManager
             catch { return false; }
         }
 
+        /// <summary>
+        /// 还有多少活没干完（含后台在跑的、做完待收的、以及元数据补测）。
+        /// 用于判断"空闲循环要不要继续调 ProcessQueue"。
+        /// </summary>
         public int PendingCount
         {
-            get { return _pending.Count + _generate.Count; }
+            get
+            {
+                int done;
+                lock (_doneLock) { done = _done.Count; }
+
+                return _pending.Count + _workers + done + _fallback.Count + _meta.Count;
+            }
+        }
+
+        /// <summary>
+        /// 是否还有**缩略图本身**没出完（不含元数据补测）。
+        /// 进度条以此为准：元数据只是角标，不该让进度条一直挂着。
+        /// </summary>
+        public bool HasPendingThumbnails
+        {
+            get
+            {
+                int done;
+                lock (_doneLock) { done = _done.Count; }
+
+                return _pending.Count > 0 || _workers > 0 || done > 0 || _fallback.Count > 0;
+            }
         }
 
         /// <summary>
@@ -267,11 +763,26 @@ namespace BlockLibraryManager
         /// <summary>
         /// 写入内存缓存 + 更新 LRU，必要时淘汰最久未用的条目。
         /// 淘汰只解除引用、不 Dispose（原因见 _cacheOrder 注释）。
+        ///
+        /// image = null 表示这一轮生成失败：除了照常写入（GetThumbnail 遇 null
+        /// 会回退占位图）之外，还必须在 _failCounts 记一笔账 —— 否则失败条目
+        /// 会被反复排队，对真坏文件无限开 Database。
         /// </summary>
         private void PutCache(string key, Image image)
         {
             _memoryCache[key] = image;
             TouchCache(key);
+
+            if (image == null)
+            {
+                int fails;
+                _failCounts.TryGetValue(key, out fails);
+                _failCounts[key] = fails + 1;
+            }
+            else
+            {
+                _failCounts.Remove(key);   // 成功出图就销账
+            }
 
             while (_cacheOrder.Count > MaxMemoryCache)
             {
@@ -285,8 +796,9 @@ namespace BlockLibraryManager
         private Image TryLoadCached(BlockItem item)
         {
             if (item == null) return null;
-            if (!File.Exists(GetCachePath(item.FilePath))) return null;
-            return TryLoadPng(GetCachePath(item.FilePath));
+            string path = GetCachePath(item.FilePath);
+            if (!File.Exists(path)) return null;
+            return TryLoadPng(path, _config.ThumbSize);
         }
 
         // ---------- 动态块标记 ----------
@@ -328,6 +840,53 @@ namespace BlockLibraryManager
             catch
             {
                 // 标记写不进去只影响角标显示，不影响功能
+            }
+        }
+
+        /// <summary>
+        /// 写入"已检测、确认不是动态块"的标记。
+        /// 没有这个标记就无法区分"还没检测过"和"检测过但不是动态块"，
+        /// 于是每次启动都要为同一批文件重开一次 Database。落盘之后第二次起全是零成本。
+        /// </summary>
+        private void WritePlainMarker(string dwgPath)
+        {
+            try
+            {
+                string marker = GetCachePath(dwgPath) + ".nodyn";
+                if (!File.Exists(marker))
+                    File.WriteAllBytes(marker, new byte[0]);
+            }
+            catch
+            {
+                // 同上，只影响角标
+            }
+        }
+
+        /// <summary>文件被判定为动态块时，要把可能存在的"非动态块"标记删掉。</summary>
+        private void RemovePlainMarker(string dwgPath)
+        {
+            try
+            {
+                string marker = GetCachePath(dwgPath) + ".nodyn";
+                if (File.Exists(marker)) File.Delete(marker);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// 该文件的动态块属性是否已经检测过（.dyn / .nodyn 有一个就算）。
+        /// 没检测过才需要排进 _meta 队列去开一次图纸。
+        /// </summary>
+        private bool HasDynamicMeta(string dwgPath)
+        {
+            try
+            {
+                string basePath = GetCachePath(dwgPath);
+                return File.Exists(basePath + ".dyn") || File.Exists(basePath + ".nodyn");
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -412,9 +971,8 @@ namespace BlockLibraryManager
             Image img = RenderVisibilityState(item, states[index]);
             if (img == null) return;
 
-            // 注意：旧图**不能**在这里 Dispose。它可能正被 ImageList / 列表项引用着
-            // （CreateDisplayImage 对非动态块直接返回缓存里的同一实例），
-            // 释放后界面重绘就会抛"参数无效"。只替换引用，旧的交给 GC 回收。
+            // 注意：旧图**不能**在这里 Dispose。它可能正被列表的自绘代码 / 屏幕重绘
+            // 路径引用着，释放后界面重绘就会抛"参数无效"。只替换引用，旧的交给 GC 回收。
             PutCache(item.Key, img);
 
             SavePng(img, GetCachePath(item.FilePath));
@@ -652,6 +1210,25 @@ namespace BlockLibraryManager
             }
         }
 
+        /// <summary>
+        /// 写入一个空的可见性标记，表示"这个文件已经检测过，没有可见性状态"。
+        /// 与 .nodyn 同理：空文件本身不影响 GetVisibilityStates（读出来就是空列表），
+        /// 但能避免同一个动态块每次启动都被重复导出一次 DXF 去解析。
+        /// </summary>
+        private void WriteEmptyVisibilityMarker(string dwgPath)
+        {
+            try
+            {
+                string marker = GetCachePath(dwgPath) + ".vis";
+                if (!File.Exists(marker))
+                    File.WriteAllBytes(marker, new byte[0]);
+            }
+            catch
+            {
+                // 同上，只影响切换按钮
+            }
+        }
+
         /// <summary>删除可见性状态标记文件（检测不到可见性状态时清理旧标记）。</summary>
         private void RemoveVisibilityMarker(string dwgPath)
         {
@@ -805,8 +1382,9 @@ namespace BlockLibraryManager
                     int dark = 0, total = 0;
                     Action<int, int> sample = delegate (int x, int y)
                     {
-                        int i = y * stride + x * 4;      // BGRA
-                        int lum = (buffer[i] * 299 + buffer[i + 1] * 587 + buffer[i + 2] * 114) / 1000;
+                        int i = y * stride + x * 4;      // BGRA：i=B, i+1=G, i+2=R
+                        // 亮度 = 299*R + 587*G + 114*B（写成 B、G、R 的顺序会把红蓝算反）
+                        int lum = (buffer[i + 2] * 299 + buffer[i + 1] * 587 + buffer[i] * 114) / 1000;
                         if (lum < 64) dark++;
                         total++;
                     };
@@ -849,7 +1427,8 @@ namespace BlockLibraryManager
                 // 背景判定阈值：黑底亮度 < 80，白底亮度 > 208
                 Func<int, bool> isBg = delegate (int i)
                 {
-                    int lum = (buffer[i] * 299 + buffer[i + 1] * 587 + buffer[i + 2] * 114) / 1000;
+                    // 同为 BGRA：R 在 i+2、B 在 i
+                    int lum = (buffer[i + 2] * 299 + buffer[i + 1] * 587 + buffer[i] * 114) / 1000;
                     return darkEdge ? lum < 80 : lum > 208;
                 };
 
@@ -912,8 +1491,8 @@ namespace BlockLibraryManager
 
         /// <summary>
         /// 清空全部缩略图缓存（内存 + 磁盘 PNG），用于切换底色模式后强制重新生成。
-        /// 注意：这里只解除引用、不主动 Dispose —— 部分图像此刻还在 ListView 的
-        /// ImageList / 屏幕重绘路径里被引用，立即释放会在 UI 重绘时抛
+        /// 注意：这里只解除引用、不主动 Dispose —— 部分图像此刻还在列表的自绘
+        /// 绘制路径里被引用，立即释放会在 UI 重绘时抛
         /// "System.ArgumentException: 参数无效"（Image.get_Width 访问已释放对象）。
         /// 释放交给 GC 终结器稍后处理；动态块 / 可见性检测结果标记保留。
         /// </summary>
@@ -923,8 +1502,19 @@ namespace BlockLibraryManager
             _cacheOrder.Clear();
             _pendingKeys.Clear();
             _pending.Clear();
-            _generate.Clear();
+            _fallback.Clear();
+            _fallbackKeys.Clear();
+            _meta.Clear();
+            _metaKeys.Clear();
             _visIndex.Clear();
+
+            // 失败账本也必须一起清：切底色 / 改规格后所有图都要重出，
+            // 而 _failCounts 记到上限的条目会被 RequestThumbnails 无条件跳过，
+            // 不清就永远停在占位图上，只能等下一次 Suspend/Resume 才恢复。
+            _failCounts.Clear();
+            _metaFails.Clear();
+
+            lock (_doneLock) { _done.Clear(); }
 
             try
             {
@@ -941,6 +1531,64 @@ namespace BlockLibraryManager
             {
                 // 磁盘清不掉时，靠内存缓存清空 + 重新生成覆盖同名文件
             }
+
+            // 缩略图规格（ThumbSize）可能已经变了，占位图必须按新规格重画，
+            // 否则会一直留着按旧尺寸画的那张（小规格下 "DWG" 会换行、被切掉）。
+            DropPlaceholders();
+        }
+
+        /// <summary>丢掉两张占位图，下次取用时按当前 ThumbSize 重画。
+        /// 缩略图规格（ThumbSize）改过之后必须调用，否则会一直用按旧尺寸画的那张。</summary>
+        public void DropPlaceholders()
+        {
+            if (_placeholderWhole != null) { try { _placeholderWhole.Dispose(); } catch { } }
+            if (_placeholderInner != null) { try { _placeholderInner.Dispose(); } catch { } }
+            _placeholderWhole = null;
+            _placeholderInner = null;
+        }
+
+        /// <summary>
+        /// 文件被重命名 / 移动后调用：丢弃旧路径的全部缓存痕迹——
+        /// 内存缩略图、磁盘 PNG、动态块 / 可见性标记、失败账本。
+        /// 新路径首次出图时按新文件重新生成，不会残留旧图。
+        /// </summary>
+        public void ForgetItem(string filePath)
+        {
+            if (string.IsNullOrEmpty(filePath)) return;
+
+            try
+            {
+                // 与 BlockItem.FromFile 的 key 规则保持一致（"file:" + 小写全路径）
+                string key = "file:" + filePath.ToLowerInvariant();
+
+                _memoryCache.Remove(key);
+                _cacheOrder.RemoveAll(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
+                _dynamicFlags.Remove(key);
+                _visStates.Remove(key);
+                _visData.Remove(key);
+                _failCounts.Remove(key);
+                _metaFails.Remove(key);
+
+                // 磁盘侧：缩略图 PNG 与三个检测标记都挂在"路径的 MD5"上
+                string basePath = GetCachePath(filePath);
+                string[] files = new string[]
+                {
+                    basePath,
+                    basePath + ".dyn",
+                    basePath + ".nodyn",
+                    basePath + ".vis"
+                };
+
+                foreach (string path in files)
+                {
+                    try { if (File.Exists(path)) File.Delete(path); }
+                    catch { }
+                }
+            }
+            catch
+            {
+                // 清理失败不影响重命名本身，最多是多生成一次缩略图
+            }
         }
 
         private void RaiseReady(BlockItem item)
@@ -955,7 +1603,14 @@ namespace BlockLibraryManager
 
         // ---------- 生成 ----------
 
-        private Image CreateThumbnail(BlockItem item)
+        /// <summary>
+        /// 兜底出图：内嵌预览取不到时（THUMBSAVE=0 存的图、R13 以前、第三方工具生成），
+        /// 只好打开 Database。既然图纸已经打开了，元数据（动态块 / 可见性）顺手一起测掉，
+        /// 避免同一个文件被打开两次。
+        ///
+        /// 注意：这条路必须在 AutoCAD 主线程调用，且很慢，所以只给"直读失败"的条目走。
+        /// </summary>
+        private Image GenerateFromDatabase(BlockItem item)
         {
             if (item == null || string.IsNullOrEmpty(item.FilePath)) return null;
             if (!File.Exists(item.FilePath)) return null;
@@ -973,48 +1628,42 @@ namespace BlockLibraryManager
                 // 顺带检测该 DWG 是否含动态块定义（数据库已打开，代价极小）
                 bool dyn = DetectDynamicBlock(db);
                 _dynamicFlags[item.Key] = dyn;
-                if (dyn) WriteDynamicMarker(item.FilePath);
 
-                // 可见性状态检测需要把整个 DWF 导出成 DXF 文本再解析（DxfOut，开销很大），
-                // 只对真正含动态块的文件做——普通图块（绝大多数）直接跳过，大幅缩短生成时间。
-                List<string> visStates;
                 if (dyn)
                 {
-                    visStates = DetectVisibilityStateNames(item.Key, db);
+                    WriteDynamicMarker(item.FilePath);
+                    RemovePlainMarker(item.FilePath);
+
+                    // 可见性状态检测需要把整个 DWG 导出成 DXF 文本再解析（DxfOut，开销很大），
+                    // 只对真正含动态块的文件做——普通图块（绝大多数）直接跳过。
+                    List<string> visStates = DetectVisibilityStateNames(item.Key, db);
+                    _visStates[item.Key] = visStates ?? new List<string>();
+
+                    if (visStates != null && visStates.Count >= 2)
+                        WriteVisibilityMarker(item.FilePath, visStates);
+                    else
+                        WriteEmptyVisibilityMarker(item.FilePath);
                 }
                 else
                 {
-                    visStates = new List<string>();
+                    _visStates[item.Key] = new List<string>();
                     _visData[item.Key] = new List<VisParamData>();   // 非动态块，无需解析
+                    WritePlainMarker(item.FilePath);
                 }
-                _visStates[item.Key] = visStates;
-                if (visStates != null && visStates.Count >= 2)
-                    WriteVisibilityMarker(item.FilePath, visStates);
-                else
-                    RemoveVisibilityMarker(item.FilePath);
 
+                int size = _config.ThumbSize;
+                if (size < 48) size = 48;
+
+                // 预览段直读已经失败过一次，但 Database 里可能还有一张
+                //（例如文件里的预览段损坏、而 CAD 自己能解出来）
                 using (Bitmap preview = db.ThumbnailBitmap)
                 {
                     if (preview != null)
-                    {
-                        // 不少 DWG 的预览位图右缘带一条与图块内容无关的纯黑竖带，
-                        // 直接缩放就会出现"缩略图右侧黑边"。先裁掉再适配画布。
-                        using (Bitmap trimmed = TrimRightBlackBand(preview))
-                        // 按当前底色模式把黑底图转白底（或白底图转黑底），只替换连通背景色
-                        using (Bitmap modeApplied = ApplyBackgroundMode(trimmed))
-                        {
-                            int size = _config.ThumbSize;
-                            Image fitted = FitToCanvas(modeApplied, size, size,
-                                WhiteBackground ? Color.White : Color.Black);
-                            SavePng(fitted, GetCachePath(item.FilePath));
-                            result = fitted;
-                        }
-                    }
+                        result = BuildThumbnail(preview, item.FilePath);
                 }
 
-                // 兜底：很多 DWG 保存时没写预览位图（ThumbnailBitmap 为空），
-                // 之前会一直显示"DWG"占位图。现在退而求其次——把模型空间的
-                // 几何（含块参照逐层展开）自绘成线框预览。
+                // 再兜一层：连 Database 里都没有预览位图，就把模型空间的几何
+                //（含块参照逐层展开）自绘成线框预览。
                 if (result == null)
                 {
                     Image fallback = RenderPreview(db, null);
@@ -1081,6 +1730,10 @@ namespace BlockLibraryManager
         /// </summary>
         private Image RenderPreview(AcadDb db, VisFilter filter)
         {
+            // 必须在 try 外面声明：try 块里声明的变量在 catch 里是看不见的，
+            // 而异常路径要靠它把半成品位图释放掉（GDI 句柄泄漏）。
+            Bitmap canvas = null;
+
             try
             {
                 List<AcadPts> polylines = new List<AcadPts>();
@@ -1120,7 +1773,7 @@ namespace BlockLibraryManager
                 double offsetX = (size - w * scale) / 2.0 - bounds.MinX * scale;
                 double offsetY = (size + h * scale) / 2.0 + bounds.MinY * scale;
 
-                Bitmap canvas = new Bitmap(size, size, PixelFormat.Format24bppRgb);
+                canvas = new Bitmap(size, size, PixelFormat.Format24bppRgb);
                 using (Graphics g = Graphics.FromImage(canvas))
                 {
                     // 线框兜底渲染同样跟随底色模式：白底黑线 / 黑底白线
@@ -1152,6 +1805,12 @@ namespace BlockLibraryManager
             }
             catch
             {
+                // 画到一半出错时 canvas 已经建出来了，不释放就是一次 GDI 句柄泄漏
+                if (canvas != null)
+                {
+                    try { canvas.Dispose(); } catch { }
+                    canvas = null;
+                }
                 return null;
             }
         }
@@ -1330,7 +1989,13 @@ namespace BlockLibraryManager
                     byte[] buffer = new byte[stride * height];
                     Marshal.Copy(data.Scan0, buffer, 0, buffer.Length);
 
-                    int maxBand = width / 3;                     // 黑带超过 1/3 宽就放弃
+                    int maxBand = width / 6;                     // 黑带超过 1/6 宽就放弃
+
+                    // 整张图本来就偏黑（黑底预览 / 深色图纸）时一律不裁：
+                    // 这种图右侧的每一列都满足"几乎全黑"，循环会一路跑到 maxBand，
+                    // 结果就是把图切掉一大块——以前 maxBand 取 1/3，实测会切掉三分之一。
+                    if (IsMostlyDarkImage(buffer, stride, width, height)) return source;
+
                     int col = width - 1;
                     lastNonBlack = width - 1;
 
@@ -1358,6 +2023,29 @@ namespace BlockLibraryManager
             {
                 return source;
             }
+        }
+
+        /// <summary>
+        /// 整张图是否"几乎全黑"（≥85% 采样点 RGB 都低于 32）。
+        /// 用于裁右缘黑带前的兜底：这种图本来就是黑底，裁了等于把内容切掉。
+        /// </summary>
+        private static bool IsMostlyDarkImage(byte[] buffer, int stride, int width, int height)
+        {
+            int stepX = Math.Max(1, width / 60);
+            int stepY = Math.Max(1, height / 60);
+            int black = 0, total = 0;
+
+            for (int y = 0; y < height; y += stepY)
+            {
+                for (int x = 0; x < width; x += stepX)
+                {
+                    int idx = y * stride + x * 4;
+                    if (buffer[idx] < 32 && buffer[idx + 1] < 32 && buffer[idx + 2] < 32) black++;
+                    total++;
+                }
+            }
+
+            return total > 0 && black * 100 >= total * 85;
         }
 
         /// <summary>判断一列是否"几乎全黑"（≥90% 采样像素 RGB 都低于 32）。</summary>
@@ -1391,10 +2079,28 @@ namespace BlockLibraryManager
             int size = _config.ThumbSize;
             string folder = CacheFolder;
 
-            CleanLegacyCacheOnce(folder);
-            PruneDiskCacheOnce(folder);
+            EnsureCacheFolderReady(folder);
 
             return Path.Combine(folder, CacheVersionPrefix + key + "_" + size + ".png");
+        }
+
+        /// <summary>缓存目录的一次性初始化（清旧版缓存 + 容量裁剪）。</summary>
+        private static readonly object _cacheInitLock = new object();
+
+        /// <summary>
+        /// 这两件一次性清理工作现在会被**后台线程**并发触发（出图已经并行化），
+        /// 而它们内部是"看一眼标志位就开始删文件"，两个线程同时进来就会一边删一边读。
+        /// 这里统一串行化：既保证只做一次，也保证不会和正在读缓存的线程打架。
+        /// </summary>
+        private static void EnsureCacheFolderReady(string folder)
+        {
+            if (_legacyCacheCleaned && _diskCachePruned) return;
+
+            lock (_cacheInitLock)
+            {
+                CleanLegacyCacheOnce(folder);
+                PruneDiskCacheOnce(folder);
+            }
         }
 
         /// <summary>
@@ -1405,7 +2111,6 @@ namespace BlockLibraryManager
         private static void CleanLegacyCacheOnce(string folder)
         {
             if (_legacyCacheCleaned) return;
-            _legacyCacheCleaned = true;
 
             try
             {
@@ -1435,6 +2140,19 @@ namespace BlockLibraryManager
 
                     try { File.Delete(file); } catch { }
                 }
+
+                // 旧版的"非动态块"标记（.png.nodyn）同样要清，否则会一直堆积
+                foreach (string file in Directory.GetFiles(folder, "*.png.nodyn"))
+                {
+                    string name = Path.GetFileName(file);
+                    if (name.StartsWith(CacheVersionPrefix, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    try { File.Delete(file); } catch { }
+                }
+
+                // 删除跑完才置位：标志位是给别的线程"可以看缓存了"的信号，
+                // 提前置位会让另一路 worker 在删除进行中去读这些 PNG。
+                _legacyCacheCleaned = true;
             }
             catch
             {
@@ -1456,7 +2174,6 @@ namespace BlockLibraryManager
         private static void PruneDiskCacheOnce(string folder)
         {
             if (_diskCachePruned) return;
-            _diskCachePruned = true;
 
             try
             {
@@ -1482,11 +2199,17 @@ namespace BlockLibraryManager
 
                     try
                     {
+                        // 三种标记文件都要跟着删，漏掉 .nodyn 会让缓存目录只增不减——
+                        // 而且容量统计是按 *.png 算的，永远统计不到它们。
                         if (File.Exists(path + ".dyn")) File.Delete(path + ".dyn");
+                        if (File.Exists(path + ".nodyn")) File.Delete(path + ".nodyn");
                         if (File.Exists(path + ".vis")) File.Delete(path + ".vis");
                     }
                     catch { }
                 }
+
+                // 与清理旧缓存同理：删完才置位
+                _diskCachePruned = true;
             }
             catch
             {
@@ -1527,7 +2250,26 @@ namespace BlockLibraryManager
             }
         }
 
-        private static Image TryLoadPng(string path)
+        /// <summary>
+        /// 允许的"过采样倍率"。缓存图比显示尺寸略大一点点（1.5 倍），
+        /// 高分屏下拉伸时不会发虚；超过这个倍率就一律降采样。
+        /// </summary>
+        private const double DecodeOversample = 1.5;
+
+        /// <summary>
+        /// 解码时降采样 —— 本项目的 GDI+ 版 DecodePixelWidth。
+        ///
+        /// WPF 里设 BitmapImage.DecodePixelWidth 能让解码器直接产出小图，
+        /// 省掉"先解码整张大图、再在内存里缩小"的那一遍；GDI+ 没有对应的
+        /// 解码参数，只能在解码后**立刻**重采样、然后马上释放大图与流，
+        /// 达到同样的效果：留在缓存里的是目标尺寸的小图，而不是原始大图。
+        ///
+        /// 顺带解决另一个隐患：Image.FromStream 要求底层流在 Image 的整个
+        /// 生命周期里保持打开，原来的写法把 MemoryStream 一直挂在那儿，
+        /// 每张缩略图都额外占着一份完整的文件字节。现在统一复制/重采样后
+        /// 立即 using 释放。
+        /// </summary>
+        private static Image TryLoadPng(string path, int targetSize)
         {
             try
             {
@@ -1535,14 +2277,60 @@ namespace BlockLibraryManager
 
                 // 不能直接 Image.FromFile，那会锁住文件
                 byte[] bytes = File.ReadAllBytes(path);
-                MemoryStream stream = new MemoryStream(bytes);
-                Image img = Image.FromStream(stream);
-                return img;
+                using (MemoryStream stream = new MemoryStream(bytes, false))
+                using (Image raw = Image.FromStream(stream))
+                {
+                    if (targetSize <= 0) return new Bitmap(raw);
+
+                    int limit = Math.Max(16, (int)(targetSize * DecodeOversample));
+
+                    // 已经够小：复制一份断开与流的绑定即可（复制本身很便宜）
+                    if (raw.Width <= limit && raw.Height <= limit)
+                        return new Bitmap(raw);
+
+                    // 大图：立刻按目标尺寸降采样，大图本体出 using 即释放
+                    return ResampleWithin(raw, limit);
+                }
             }
             catch
             {
                 return null;
             }
+        }
+
+        /// <summary>
+        /// 等比重采样，使最长边不超过 maxSide（小图不放大）。
+        /// 返回的 Bitmap 由调用方负责释放；失败返回 null。
+        /// </summary>
+        private static Bitmap ResampleWithin(Image source, int maxSide)
+        {
+            if (source == null || source.Width <= 0 || source.Height <= 0) return null;
+
+            int w = source.Width;
+            int h = source.Height;
+            double scale = Math.Min((double)maxSide / w, (double)maxSide / h);
+
+            if (scale >= 1.0) return new Bitmap(source);
+
+            int nw = Math.Max(1, (int)Math.Round(w * scale));
+            int nh = Math.Max(1, (int)Math.Round(h * scale));
+
+            // 缓存图一律不透明（FitToCanvas / RenderPreview 画的都是不透明画布），
+            // 用 24bpp 比 32bpp 省 25% 内存
+            Bitmap result = new Bitmap(nw, nh, PixelFormat.Format24bppRgb);
+            using (Graphics g = Graphics.FromImage(result))
+            {
+                // 大比例缩小时双三次会振铃出噪点，改用双线性；
+                // 小比例（≥1/3）才用双三次保留细节。
+                g.InterpolationMode = scale < 0.34
+                    ? InterpolationMode.HighQualityBilinear
+                    : InterpolationMode.HighQualityBicubic;
+                g.SmoothingMode = SmoothingMode.HighQuality;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.Clear(Color.White);
+                g.DrawImage(source, new Rectangle(0, 0, nw, nh));
+            }
+            return result;
         }
 
         public Image GetPlaceholder(bool wholeDrawing)
@@ -1566,20 +2354,59 @@ namespace BlockLibraryManager
             using (Graphics g = Graphics.FromImage(bmp))
             {
                 g.Clear(Color.WhiteSmoke);
-                using (Pen pen = new Pen(color, 2f))
+
+                float penWidth = Math.Max(1f, size / 48f);   // 边框粗细也跟着规格走
+                using (Pen pen = new Pen(color, penWidth))
                 {
                     g.DrawRectangle(pen, 2, 2, size - 5, size - 5);
                 }
+
+                // 字号必须随缩略图规格缩放：以前固定 14pt，规格调小（48 / 64）时
+                // "DWG" 会被挤得换行、撑出边框，画面上只剩被切掉的两个字母。
+                float px = FitTextPixels(g, text, size);
+
                 using (Brush brush = new SolidBrush(color))
-                using (Font font = new Font("Microsoft YaHei", 14f, FontStyle.Bold))
+                using (Font font = new Font(PlaceholderFontName, px, FontStyle.Bold, GraphicsUnit.Pixel))
                 {
                     StringFormat sf = new StringFormat();
                     sf.Alignment = StringAlignment.Center;
                     sf.LineAlignment = StringAlignment.Center;
-                    g.DrawString(text, font, brush, new RectangleF(0, 0, size, size), sf);
+                    sf.FormatFlags = StringFormatFlags.NoWrap;      // 绝不换行，换行就是显示不全
+                    sf.Trimming = StringTrimming.None;
+                    g.DrawString(text, font, brush,
+                        new RectangleF(0, 0, size, size), sf);
                 }
             }
             return bmp;
+        }
+
+        /// <summary>占位图文字所用的字体族（各 Windows 版本都有，缺字体时 GDI+ 会自己回退）。</summary>
+        private const string PlaceholderFontName = "Microsoft YaHei";
+
+        /// <summary>
+        /// 把文字压到"单行能放下"的字号（像素）。
+        /// 目标：宽度不超过边长的 78%、高度不超过 62%，保证任何规格下都不换行、不出框。
+        /// </summary>
+        private static float FitTextPixels(Graphics g, string text, int size)
+        {
+            float maxWidth = size * 0.78f;
+            float maxHeight = size * 0.62f;
+            float px = size * 0.42f;              // 起点：约半格；多字符会被下面逐步压小
+            if (px < 5f) px = 5f;
+
+            for (int i = 0; i < 16; i++)
+            {
+                using (Font font = new Font(PlaceholderFontName, px, FontStyle.Bold, GraphicsUnit.Pixel))
+                {
+                    SizeF m = g.MeasureString(text, font);
+                    if (m.Width <= maxWidth && m.Height <= maxHeight) break;
+                }
+
+                px *= 0.88f;
+                if (px < 5f) { px = 5f; break; }
+            }
+
+            return px;
         }
 
         public void Dispose()
@@ -1593,7 +2420,12 @@ namespace BlockLibraryManager
             _cacheOrder.Clear();
             _pendingKeys.Clear();
             _pending.Clear();
-            _generate.Clear();
+            _fallback.Clear();
+            _fallbackKeys.Clear();
+            _meta.Clear();
+            _metaKeys.Clear();
+
+            lock (_doneLock) { _done.Clear(); }
 
             // 占位图是本服务自己创建、且从不外泄所有权的，可以安全释放
             if (_placeholderWhole != null) { try { _placeholderWhole.Dispose(); } catch { } }

@@ -1,15 +1,21 @@
 using System;
-using System.IO;
-using System.Text;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Reflection;
+using System.Text;
 
 namespace BlockLibraryManager
 {
     /// <summary>
-    /// 图库配置。存放位置：%APPDATA%\BlockLibraryManager\config.json
+    /// 图库配置。存放位置：**插件 DLL 所在目录**下的 BlockLibrary.ini（INI 格式）。
+    /// 例如 DLL 在 ...\ApplicationPlugins\BlockLibraryManager.bundle\Contents\CAD2019-2024\，
+    /// 配置文件就在同一个文件夹里，方便整包拷贝 / 备份。
+    /// DLL 目录不可写（装在受保护目录）时自动回退到 %APPDATA%\BlockLibraryManager\BlockLibrary.ini。
+    ///
     /// 这里刻意不用 DataContractJsonSerializer / System.Text.Json，
     /// 因为它们在 net35(CAD2010) 与 net8(CAD2025+) 之间的可用性不一致；
-    /// 自己拼配 JSON 反而是全版本通用的最小方案。
+    /// 手写的 INI 读写反而是全版本通用、且能直接用记事本改的最小方案。
     /// </summary>
     public sealed class LibraryConfig
     {
@@ -36,6 +42,12 @@ namespace BlockLibraryManager
 
         /// <summary>搜索时是否包含下级分类。</summary>
         public bool SearchSubCategories { get; set; }
+
+        /// <summary>
+        /// 插入参数面板的"插入图形后关闭窗口"勾选状态（持久化）。
+        /// 勾选后每次插入成功自动收起图库管理器窗口。
+        /// </summary>
+        public bool InsertCloseAfter { get; set; }
 
         /// <summary>图块文件扩展名过滤，大小写不敏感。</summary>
         public StringList FileFilters { get; private set; }
@@ -87,7 +99,7 @@ namespace BlockLibraryManager
 
         /// <summary>
         /// 界面配色主题下标（对应 UiThemes.All）。
-        /// 0 = 默认（跟随系统），1 = 清新蓝，2 = 薄荷绿，3 = 浅绿，4 = 暖阳橙。
+        /// 0 = 默认（跟随系统），1 = 清新蓝，2 = 薄荷绿，3 = 深黑灰，4 = 暖阳橙。
         /// </summary>
         public int Theme { get; set; }
 
@@ -116,6 +128,7 @@ namespace BlockLibraryManager
             PaletteWidth = 320;
             ExpandInnerBlocks = false;
             SearchSubCategories = true;
+            InsertCloseAfter = false;
             RecentLimit = 20;
             WindowLeft = -1;
             WindowTop = -1;
@@ -143,12 +156,54 @@ namespace BlockLibraryManager
             }
         }
 
+        /// <summary>配置文件名（INI 格式，与 DLL 同目录）。</summary>
+        private const string ConfigFileName = "BlockLibrary.ini";
+
+        /// <summary>本插件 DLL 所在目录。取不到时返回空串。</summary>
+        public static string AssemblyDirectory
+        {
+            get
+            {
+                try
+                {
+                    string location = Assembly.GetExecutingAssembly().Location;
+                    if (string.IsNullOrEmpty(location)) return string.Empty;
+
+                    string dir = Path.GetDirectoryName(location);
+                    return dir == null ? string.Empty : dir;
+                }
+                catch
+                {
+                    return string.Empty;
+                }
+            }
+        }
+
+        /// <summary>回退目录：DLL 所在目录不可写时用。</summary>
         private static string AppDataFolder
         {
             get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "BlockLibraryManager"); }
         }
 
-        private static string ConfigFilePath
+        /// <summary>首选配置路径：DLL 同目录的 BlockLibrary.ini。</summary>
+        public static string ConfigFilePath
+        {
+            get
+            {
+                string dir = AssemblyDirectory;
+                if (string.IsNullOrEmpty(dir)) return Path.Combine(AppDataFolder, ConfigFileName);
+                return Path.Combine(dir, ConfigFileName);
+            }
+        }
+
+        /// <summary>回退配置路径（DLL 目录不可写时用）。</summary>
+        private static string FallbackConfigPath
+        {
+            get { return Path.Combine(AppDataFolder, ConfigFileName); }
+        }
+
+        /// <summary>旧版配置路径，仅用于首次启动迁移历史设置。</summary>
+        private static string LegacyConfigPath
         {
             get { return Path.Combine(AppDataFolder, "config.json"); }
         }
@@ -159,8 +214,24 @@ namespace BlockLibraryManager
             try
             {
                 string path = ConfigFilePath;
-                if (!File.Exists(path))
+                bool hasIni = File.Exists(path);
+
+                if (!hasIni)
                 {
+                    string fallback = FallbackConfigPath;
+                    if (File.Exists(fallback)) { path = fallback; hasIni = true; }
+                }
+
+                if (!hasIni)
+                {
+                    // 第一次用新版：如果旧版 config.json 还在，把它迁过来，别让用户重新配一遍
+                    if (File.Exists(LegacyConfigPath))
+                    {
+                        LoadLegacyJson(config);
+                        config.Save();
+                        return config;
+                    }
+
                     // 首次运行：给一个默认的“我的图库”目录并落盘
                     config.RootPaths.Add(DefaultRootPath);
                     try { if (!Directory.Exists(DefaultRootPath)) Directory.CreateDirectory(DefaultRootPath); } catch { }
@@ -168,9 +239,83 @@ namespace BlockLibraryManager
                     return config;
                 }
 
-                string json = File.ReadAllText(path, Encoding.UTF8);
+                string text = File.ReadAllText(path, Encoding.UTF8);
+                Dictionary<string, List<KeyValuePair<string, string>>> ini = ParseIni(text);
+
+                config.LastCategoryPath = GetIniString(ini, "General", "LastCategoryPath", string.Empty);
+                config.ThumbSize = GetIniInt(ini, "General", "ThumbSize", 120);
+                config.ViewMode = (GalleryView)GetIniInt(ini, "General", "ViewMode", 0);
+                config.PaletteWidth = GetIniInt(ini, "General", "PaletteWidth", 320);
+                config.ExpandInnerBlocks = GetIniBool(ini, "General", "ExpandInnerBlocks", false);
+                config.SearchSubCategories = GetIniBool(ini, "General", "SearchSubCategories", true);
+                config.InsertCloseAfter = GetIniBool(ini, "General", "InsertCloseAfter", false);
+                config.RecentLimit = GetIniInt(ini, "General", "RecentLimit", 20);
+                config.WindowLeft = GetIniInt(ini, "General", "WindowLeft", -1);
+                config.WindowTop = GetIniInt(ini, "General", "WindowTop", -1);
+                config.WindowWidth = GetIniInt(ini, "General", "WindowWidth", -1);
+                config.WindowHeight = GetIniInt(ini, "General", "WindowHeight", -1);
+                config.TreePanelWidth = GetIniInt(ini, "General", "TreePanelWidth", 0);
+                config.LeftSplitDistance = GetIniInt(ini, "General", "LeftSplitDistance", 0);
+                config.Language = GetIniString(ini, "General", "Language", string.Empty);
+                config.Theme = GetIniInt(ini, "General", "Theme", 0);
+                config.ThumbBackground = GetIniString(ini, "General", "ThumbBackground", "white");
+                config.LaunchCommand = GetIniString(ini, "General", "LaunchCommand", "BLOCKLIB");
+
+                // 构造函数里已有默认值，这里必须先清空再填充，否则会重复叠加
+                config.RootPaths.Clear();
+                config.RecentFiles.Clear();
+                config.FileFilters.Clear();
+                config.ExcludedPaths.Clear();
+                config.FavoritePaths.Clear();
+
+                GetIniList(ini, "RootPaths", config.RootPaths);
+                GetIniList(ini, "RecentFiles", config.RecentFiles);
+                GetIniList(ini, "FileFilters", config.FileFilters);
+                GetIniList(ini, "ExcludedPaths", config.ExcludedPaths);
+                GetIniList(ini, "FavoritePaths", config.FavoritePaths);
+
+                if (config.RootPaths.Count == 0)
+                    config.RootPaths.Add(DefaultRootPath);
+                if (config.FileFilters.Count == 0)
+                {
+                    config.FileFilters.Add("*.dwg");
+                    config.FileFilters.Add("*.dwt");
+                }
+                // 上界取主题表实际长度，以后新增配色不用再回来改这个数字
+                int maxTheme = UiThemes.All.Length - 1;
+                if (config.Theme < 0) config.Theme = 0;
+                if (config.Theme > maxTheme) config.Theme = maxTheme;
+                // 大小写不敏感：手填 "Black" 以前会被当成非法值静默改回 white
+                config.ThumbBackground = string.Equals(config.ThumbBackground, "black",
+                    StringComparison.OrdinalIgnoreCase) ? "black" : "white";
+
+                if (string.IsNullOrEmpty(config.LaunchCommand)) config.LaunchCommand = "BLOCKLIB";
+                if (config.ThumbSize < 48) config.ThumbSize = 48;
+                if (config.ThumbSize > 256) config.ThumbSize = 256;
+                if (config.PaletteWidth < 200) config.PaletteWidth = 200;
+
+                // 上界必须夹住：设置窗体的数字框上限就是 100，INI 里写 500 会让
+                // "设置"一打开就抛 ArgumentOutOfRangeException，一路冒到 AutoCAD。
+                if (config.RecentLimit < 0) config.RecentLimit = 0;
+                if (config.RecentLimit > 100) config.RecentLimit = 100;
+                if (config.TreePanelWidth < 0) config.TreePanelWidth = 0;
+                if (config.LeftSplitDistance < 0) config.LeftSplitDistance = 0;
+            }
+            catch
+            {
+                // 配置损坏时退回默认值，不能因为配置问题导致插件加载失败
+            }
+            return config;
+        }
+
+        /// <summary>读取旧版 %APPDATA%\config.json，把历史设置搬过来（只在新 ini 不存在时调用）。</summary>
+        private static void LoadLegacyJson(LibraryConfig config)
+        {
+            try
+            {
+                string json = File.ReadAllText(LegacyConfigPath, Encoding.UTF8);
                 MiniJson root = MiniJson.ParseObject(json);
-                if (root == null) return config;
+                if (root == null) return;
 
                 config.LastCategoryPath = MiniJson.GetString(root, "LastCategoryPath", string.Empty);
                 config.ThumbSize = MiniJson.GetInt(root, "ThumbSize", 120);
@@ -190,7 +335,6 @@ namespace BlockLibraryManager
                 config.ThumbBackground = MiniJson.GetString(root, "ThumbBackground", "white");
                 config.LaunchCommand = MiniJson.GetString(root, "LaunchCommand", "BLOCKLIB");
 
-                // 构造函数里已有默认值，这里必须先清空再填充，否则会重复叠加
                 config.RootPaths.Clear();
                 config.RecentFiles.Clear();
                 config.FileFilters.Clear();
@@ -202,41 +346,155 @@ namespace BlockLibraryManager
                 MiniJson.GetStringList(root, "FileFilters", config.FileFilters);
                 MiniJson.GetStringList(root, "ExcludedPaths", config.ExcludedPaths);
                 MiniJson.GetStringList(root, "FavoritePaths", config.FavoritePaths);
-
-                if (config.RootPaths.Count == 0)
-                    config.RootPaths.Add(DefaultRootPath);
-                if (config.FileFilters.Count == 0)
-                {
-                    config.FileFilters.Add("*.dwg");
-                    config.FileFilters.Add("*.dwt");
-                }
-                // 上界取主题表实际长度，以后新增配色不用再回来改这个数字
-                int maxTheme = UiThemes.All.Length - 1;
-                if (config.Theme < 0) config.Theme = 0;
-                if (config.Theme > maxTheme) config.Theme = maxTheme;
-                if (config.ThumbBackground != "black") config.ThumbBackground = "white";
-                if (string.IsNullOrEmpty(config.LaunchCommand)) config.LaunchCommand = "BLOCKLIB";
-                if (config.ThumbSize < 48) config.ThumbSize = 48;
-                if (config.ThumbSize > 256) config.ThumbSize = 256;
-                if (config.PaletteWidth < 200) config.PaletteWidth = 200;
-                if (config.RecentLimit < 0) config.RecentLimit = 0;
-                if (config.TreePanelWidth < 0) config.TreePanelWidth = 0;
-                if (config.LeftSplitDistance < 0) config.LeftSplitDistance = 0;
             }
             catch
             {
-                // 配置损坏时退回默认值，不能因为配置问题导致插件加载失败
+                // 迁移失败就用默认值，不影响启动
             }
-            return config;
+        }
+
+        // ---------------- INI 读写 ----------------
+
+        /// <summary>
+        /// 解析 INI 文本。返回 分区名 → (键, 值) 列表，分区名与键名均不区分大小写。
+        /// 支持 ; 与 # 开头的注释行；列表型分区靠重复键表达（顺序保留）。
+        /// </summary>
+        private static Dictionary<string, List<KeyValuePair<string, string>>> ParseIni(string text)
+        {
+            Dictionary<string, List<KeyValuePair<string, string>>> data =
+                new Dictionary<string, List<KeyValuePair<string, string>>>(StringComparer.OrdinalIgnoreCase);
+
+            if (string.IsNullOrEmpty(text)) return data;
+
+            string[] lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            string section = "General";
+            List<KeyValuePair<string, string>> bucket = null;
+
+            foreach (string raw in lines)
+            {
+                string line = raw.Trim();
+                if (line.Length == 0) continue;
+                if (line[0] == ';' || line[0] == '#') continue;
+
+                if (line[0] == '[' && line[line.Length - 1] == ']')
+                {
+                    section = line.Substring(1, line.Length - 2).Trim();
+                    if (section.Length == 0) section = "General";
+                    bucket = null;
+                    continue;
+                }
+
+                int eq = line.IndexOf('=');
+                if (eq <= 0) continue;
+
+                string key = line.Substring(0, eq).Trim();
+                string value = line.Substring(eq + 1).Trim();
+                if (key.Length == 0) continue;
+
+                if (bucket == null)
+                {
+                    if (!data.TryGetValue(section, out bucket))
+                    {
+                        bucket = new List<KeyValuePair<string, string>>();
+                        data[section] = bucket;
+                    }
+                }
+
+                bucket.Add(new KeyValuePair<string, string>(key, value));
+            }
+
+            return data;
+        }
+
+        private static string GetIniString(
+            Dictionary<string, List<KeyValuePair<string, string>>> data,
+            string section, string key, string defaultValue)
+        {
+            List<KeyValuePair<string, string>> bucket;
+            if (data == null || !data.TryGetValue(section, out bucket)) return defaultValue;
+
+            foreach (KeyValuePair<string, string> kv in bucket)
+            {
+                if (string.Equals(kv.Key, key, StringComparison.OrdinalIgnoreCase))
+                    return kv.Value;
+            }
+            return defaultValue;
+        }
+
+        private static int GetIniInt(
+            Dictionary<string, List<KeyValuePair<string, string>>> data,
+            string section, string key, int defaultValue)
+        {
+            string text = GetIniString(data, section, key, null);
+            if (string.IsNullOrEmpty(text)) return defaultValue;
+
+            int value;
+            if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+                return value;
+
+            return defaultValue;
+        }
+
+        private static bool GetIniBool(
+            Dictionary<string, List<KeyValuePair<string, string>>> data,
+            string section, string key, bool defaultValue)
+        {
+            string text = GetIniString(data, section, key, null);
+            if (string.IsNullOrEmpty(text)) return defaultValue;
+
+            if (string.Equals(text, "1", StringComparison.OrdinalIgnoreCase)) return true;
+            if (string.Equals(text, "0", StringComparison.OrdinalIgnoreCase)) return false;
+
+            bool value;
+            if (bool.TryParse(text, out value)) return value;
+
+            return defaultValue;
+        }
+
+        /// <summary>取整个分区的所有值（列表型配置，按文件里的顺序）。</summary>
+        private static void GetIniList(
+            Dictionary<string, List<KeyValuePair<string, string>>> data,
+            string section, StringList target)
+        {
+            if (target == null) return;
+
+            List<KeyValuePair<string, string>> bucket;
+            if (data == null || !data.TryGetValue(section, out bucket)) return;
+
+            foreach (KeyValuePair<string, string> kv in bucket)
+            {
+                if (string.IsNullOrEmpty(kv.Value)) continue;
+                target.Add(kv.Value);
+            }
+        }
+
+        /// <summary>把列表型配置写成一个分区（重复的键）。</summary>
+        private static void AppendIniList(StringBuilder sb, string section, string keyName, StringList items)
+        {
+            sb.Append('[').Append(section).Append("]\n");
+
+            if (items != null)
+            {
+                foreach (string item in items)
+                {
+                    if (string.IsNullOrEmpty(item)) continue;
+                    sb.Append(keyName).Append('=').Append(item).Append('\n');
+                }
+            }
+
+            sb.Append('\n');
+        }
+
+        /// <summary>写一行 键=值。</summary>
+        private static void AppendIniValue(StringBuilder sb, string key, string value)
+        {
+            sb.Append(key).Append('=').Append(value == null ? string.Empty : value).Append('\n');
         }
 
         public void Save()
         {
             try
             {
-                string folder = AppDataFolder;
-                if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
-
                 int recentLimit = RecentLimit > 0 ? RecentLimit : 0;
                 if (recentLimit > 0)
                 {
@@ -245,41 +503,62 @@ namespace BlockLibraryManager
                 }
 
                 StringBuilder sb = new StringBuilder();
-                sb.Append("{\n");
-                MiniJson.AppendStringList(sb, "RootPaths", RootPaths);
-                sb.Append(",\n");
-                MiniJson.AppendStringList(sb, "RecentFiles", RecentFiles);
-                sb.Append(",\n");
-                MiniJson.AppendStringList(sb, "FileFilters", FileFilters);
-                sb.Append(",\n");
-                MiniJson.AppendStringList(sb, "ExcludedPaths", ExcludedPaths);
-                sb.Append(",\n");
-                MiniJson.AppendStringList(sb, "FavoritePaths", FavoritePaths);
-                sb.Append(",\n");
-                sb.Append(MiniJson.MakeString("LastCategoryPath", LastCategoryPath)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("ThumbSize", ThumbSize)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("ViewMode", (int)ViewMode)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("PaletteWidth", PaletteWidth)).Append(",\n");
-                sb.Append(MiniJson.MakeBool("ExpandInnerBlocks", ExpandInnerBlocks)).Append(",\n");
-                sb.Append(MiniJson.MakeBool("SearchSubCategories", SearchSubCategories)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("RecentLimit", RecentLimit)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("WindowLeft", WindowLeft)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("WindowTop", WindowTop)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("WindowWidth", WindowWidth)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("WindowHeight", WindowHeight)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("TreePanelWidth", TreePanelWidth)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("LeftSplitDistance", LeftSplitDistance)).Append(",\n");
-                sb.Append(MiniJson.MakeString("Language", Language == null ? string.Empty : Language)).Append(",\n");
-                sb.Append(MiniJson.MakeNumber("Theme", Theme)).Append(",\n");
-                sb.Append(MiniJson.MakeString("ThumbBackground", ThumbBackground == null ? "white" : ThumbBackground)).Append(",\n");
-                sb.Append(MiniJson.MakeString("LaunchCommand", LaunchCommand == null ? "BLOCKLIB" : LaunchCommand)).Append("\n");
-                sb.Append("}\n");
+                sb.Append("; 图库管理器 BlockLibraryManager 配置文件（INI 格式）\n");
+                sb.Append("; 与插件 DLL 同目录。修改前请先关闭 CAD —— 运行时插件会整体重写本文件。\n");
+                sb.Append("; 列表型配置（RootPaths / FileFilters 等）靠重复的键表达，可自行增删行。\n\n");
 
-                File.WriteAllText(ConfigFilePath, sb.ToString(), Encoding.UTF8);
+                sb.Append("[General]\n");
+                AppendIniValue(sb, "LastCategoryPath", LastCategoryPath);
+                AppendIniValue(sb, "ThumbSize", ThumbSize.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "ViewMode", ((int)ViewMode).ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "PaletteWidth", PaletteWidth.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "ExpandInnerBlocks", ExpandInnerBlocks ? "true" : "false");
+                AppendIniValue(sb, "SearchSubCategories", SearchSubCategories ? "true" : "false");
+                AppendIniValue(sb, "InsertCloseAfter", InsertCloseAfter ? "true" : "false");
+                AppendIniValue(sb, "RecentLimit", RecentLimit.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "WindowLeft", WindowLeft.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "WindowTop", WindowTop.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "WindowWidth", WindowWidth.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "WindowHeight", WindowHeight.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "TreePanelWidth", TreePanelWidth.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "LeftSplitDistance", LeftSplitDistance.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "Language", Language == null ? string.Empty : Language);
+                AppendIniValue(sb, "Theme", Theme.ToString(CultureInfo.InvariantCulture));
+                AppendIniValue(sb, "ThumbBackground", ThumbBackground == null ? "white" : ThumbBackground);
+                AppendIniValue(sb, "LaunchCommand", LaunchCommand == null ? "BLOCKLIB" : LaunchCommand);
+                sb.Append('\n');
+
+                AppendIniList(sb, "RootPaths", "Path", RootPaths);
+                AppendIniList(sb, "FileFilters", "Filter", FileFilters);
+                AppendIniList(sb, "RecentFiles", "File", RecentFiles);
+                AppendIniList(sb, "ExcludedPaths", "Path", ExcludedPaths);
+                AppendIniList(sb, "FavoritePaths", "Path", FavoritePaths);
+
+                string content = sb.ToString();
+
+                // 首选：写在 DLL 旁边；装在受保护目录（Program Files 等）写不进去时回退到 APPDATA
+                try
+                {
+                    string dir = AssemblyDirectory;
+                    if (string.IsNullOrEmpty(dir)) throw new IOException("无法定位插件目录");
+
+                    File.WriteAllText(Path.Combine(dir, ConfigFileName), content, Encoding.UTF8);
+                }
+                catch (System.Exception primaryEx)
+                {
+                    // 首选位置写不进去（装在 Program Files 等受保护目录）时回退 APPDATA。
+                    // 记一笔日志：否则"改了设置重启又变回去"这个问题无从查起。
+                    BlmLog.Write("配置写入 DLL 目录失败，改用 %APPDATA%：" + primaryEx.Message);
+
+                    string folder = AppDataFolder;
+                    if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+                    File.WriteAllText(FallbackConfigPath, content, Encoding.UTF8);
+                }
             }
-            catch
+            catch (System.Exception ex)
             {
-                // 配置写入失败不影响主流程
+                // 配置写入失败不影响主流程，但要留痕
+                BlmLog.Write("保存配置失败", ex);
             }
         }
 
@@ -298,12 +577,11 @@ namespace BlockLibraryManager
             }
             RecentFiles.Insert(0, filePath);
 
-            int limit = RecentLimit > 0 ? RecentLimit : 0;
-            if (limit > 0)
-            {
-                while (RecentFiles.Count > limit)
-                    RecentFiles.RemoveAt(RecentFiles.Count - 1);
-            }
+            // limit 为 0 表示"不限制"是错的——那样 RecentFiles 会无限增长并整份写回 INI。
+            // 这里按默认 20 兜底，保证列表总有上界。
+            int limit = RecentLimit > 0 ? RecentLimit : 20;
+            while (RecentFiles.Count > limit)
+                RecentFiles.RemoveAt(RecentFiles.Count - 1);
         }
 
         /// <summary>新增图库根目录，已存在则忽略。</summary>

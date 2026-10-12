@@ -27,6 +27,8 @@ namespace BlockLibraryManager
         private ButtonKind _kind;
         private bool _hover;
         private bool _pressed;
+        /// <summary>本轮"按下→抬起"是否已经执行过动作，防止一次点击触发两遍。</summary>
+        private bool _pressConsumed;
 
         public TitleBarButton(ButtonKind kind)
         {
@@ -68,16 +70,29 @@ namespace BlockLibraryManager
         {
             _hover = false;
             _pressed = false;
+            _pressConsumed = false;
             Invalidate();
             base.OnMouseLeave(e);
         }
 
+        //
+        // 触发时机：左键"按下"就立刻执行，不用等抬起（v1.49.0）。
+        //
+        // 以前的写法是 MouseDown 只记状态、等 MouseUp 才触发，
+        // 但 AutoCAD 给非模态窗口装了消息过滤器（标题栏拖动那节注释里提过），
+        // WM_LBUTTONUP 有时到不了按钮 —— 用户点一下窗口毫无反应，
+        // 连点两下才切一次，看起来就像"这个按钮要双击才管用"。
+        // 现在按下即执行，单击一定生效；
+        // MouseUp 再来时因为 _pressConsumed 已置位而不会重复执行一遍。
+        //
         protected override void OnMouseDown(MouseEventArgs e)
         {
             if (e.Button == MouseButtons.Left)
             {
                 _pressed = true;
+                _pressConsumed = false;
                 Invalidate();
+                FireClick();
             }
             base.OnMouseDown(e);
         }
@@ -89,10 +104,22 @@ namespace BlockLibraryManager
             Invalidate();
             base.OnMouseUp(e);
 
+            // 按下那一下万一被宿主吞掉（过滤器只放行了抬起），这里补一次；
+            // 正常情况 _pressConsumed 已为 true，直接跳过。
             if (wasPressed && e.Button == MouseButtons.Left && ClientRectangle.Contains(e.Location))
             {
-                OnClick(EventArgs.Empty);
+                FireClick();
             }
+
+            _pressConsumed = false;
+        }
+
+        /// <summary>执行一次动作；同一轮按下只认第一次。</summary>
+        private void FireClick()
+        {
+            if (_pressConsumed) return;
+            _pressConsumed = true;
+            OnClick(EventArgs.Empty);
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -170,6 +197,62 @@ namespace BlockLibraryManager
     }
 
     /// <summary>
+    /// 标题栏左侧的 CAD 应用图标：从当前宿主进程的 exe（acad.exe / zwcad.exe /
+    /// gcad.exe / bricscad.exe）提取图标 —— 装的是哪家 CAD 就显示哪家的图标，
+    /// 天然"跟随当前版本 CAD"。
+    /// 尺寸随标题栏行高自适应（正方形，上下留边），文字用 Dock 排在图标后面，
+    /// 互不遮挡。
+    /// </summary>
+    internal sealed class TitleIconBox : Control
+    {
+        private readonly Icon _icon;
+
+        public TitleIconBox(Icon icon)
+        {
+            _icon = icon;
+
+            SetStyle(ControlStyles.UserPaint, true);
+            SetStyle(ControlStyles.AllPaintingInWmPaint, true);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer, true);
+            SetStyle(ControlStyles.ResizeRedraw, true);
+            SetStyle(ControlStyles.SupportsTransparentBackColor, true);
+            SetStyle(ControlStyles.Selectable, false);
+
+            Dock = DockStyle.Left;
+            Width = 26;
+            BackColor = Color.Transparent;
+            TabStop = false;
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+
+            // 高度随标题栏行高变化（Dock=Left 自动撑满），宽度跟随取同样大小；
+            // 夹在 18~30，标题栏再高图标也不无限放大。
+            // 判断过相等再赋值，避免 Resize 处理器里改尺寸造成无限递归。
+            int target = Math.Max(18, Math.Min(30, Height));
+            if (Width != target) Width = target;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            if (_icon == null) return;
+
+            try
+            {
+                // 上下左右各留 3px，居中画一个正方形区域
+                int side = Math.Max(8, Math.Min(ClientSize.Width, ClientSize.Height) - 6);
+                int x = (ClientSize.Width - side) / 2;
+                int y = (ClientSize.Height - side) / 2;
+                e.Graphics.DrawIcon(_icon, new Rectangle(x, y, side, side));
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>
     /// 面板顶部自定义标题栏：左边显示名称，右边是 最小化 / 最大化·还原 / 关闭 三个按钮。
     /// 宿主（PaletteSet）的行为由外部通过事件接管，这里只负责外观与点击转发。
     /// </summary>
@@ -184,6 +267,34 @@ namespace BlockLibraryManager
         private readonly TitleBarButton _btnMaximize;
         private readonly TitleBarButton _btnClose;
         private readonly ToolTip _tip;
+
+        private static Icon _cadIcon;
+        private static bool _cadIconTried;
+
+        /// <summary>
+        /// 提取当前 CAD 主程序的图标（只做一次，结果静态缓存）。
+        /// 插件就跑在 CAD 进程里，MainModule.FileName 就是 acad.exe / zwcad.exe /
+        /// gcad.exe / bricscad.exe，ExtractAssociatedIcon 拿到的就是该版本 CAD
+        /// 在资源管理器里显示的那个图标。失败（权限 / 路径异常）返回 null，
+        /// 标题栏就退回"无图标"，不影响任何功能。
+        /// </summary>
+        private static Icon GetCadAppIcon()
+        {
+            if (_cadIconTried) return _cadIcon;
+            _cadIconTried = true;
+
+            try
+            {
+                string exe = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
+                if (!string.IsNullOrEmpty(exe) && System.IO.File.Exists(exe))
+                    _cadIcon = Icon.ExtractAssociatedIcon(exe);
+            }
+            catch
+            {
+                _cadIcon = null;
+            }
+            return _cadIcon;
+        }
 
         /// <summary>标题栏渐变起止色与文字色（主题切换时更新，默认跟随系统）。</summary>
         private Color _chromeBack1 = SystemColors.GradientActiveCaption;
@@ -226,7 +337,8 @@ namespace BlockLibraryManager
             _label.Dock = DockStyle.Fill;
             _label.AutoSize = false;
             _label.TextAlign = ContentAlignment.MiddleLeft;
-            _label.Padding = new Padding(10, 0, 0, 0);
+            // 左侧留给 CAD 图标（图标控件自身已留 3px 右缘），文字不再额外缩进
+            _label.Padding = new Padding(2, 0, 0, 0);
             _label.ForeColor = SystemColors.ActiveCaptionText;
             _label.BackColor = Color.Transparent;
             _label.Font = Font;
@@ -257,10 +369,16 @@ namespace BlockLibraryManager
 
             // 注意添加顺序：Fill 先加；三个按钮按 最小化 → 最大化 → 关闭 依次加，
             // WinForms 的 Right 停靠按加入顺序反向排列，最终从左到右正好是 _ □ X。
+            // CAD 图标最后加（Dock=Left）—— 布局时它先于标题文字占住最左侧，
+            // 文字自动从图标右侧开始，两者互不遮挡。
             Controls.Add(_label);
             Controls.Add(_btnMinimize);
             Controls.Add(_btnMaximize);
             Controls.Add(_btnClose);
+
+            Icon appIcon = GetCadAppIcon();
+            if (appIcon != null)
+                Controls.Add(new TitleIconBox(appIcon));
         }
 
         public string TitleText

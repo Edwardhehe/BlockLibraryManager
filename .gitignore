@@ -11,9 +11,10 @@ dist/
 # 国产 CAD 编译时生成的替换源码
 build/**/gen/
 
-# 厂商托管程序集与 NuGet 包（版权属于中望 / 浩辰，不能再分发）
+# 厂商托管程序集与 NuGet 包（版权属于中望 / 浩辰 / Bricsys，不能再分发）
 tools/zwapi/
 tools/gcapi/
+tools/bcapi/
 tools/refstub/
 tools/ilretarget/
 

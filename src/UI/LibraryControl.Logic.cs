@@ -66,44 +66,61 @@ namespace BlockLibraryManager
         /// 添加图库目录后的重新加载：后台线程扫描 + 前台进度条，扫描结束后再重建界面。
         /// 扫描只碰文件系统，不碰 AutoCAD API（内部块展开会自动跳过），可以安全放在后台。
         /// </summary>
-        public void ReloadWithProgress(string focusPath)
+        /// <param name="focusPath">扫描结束后要定位到的目录。</param>
+        /// <param name="announceAdd">
+        /// 是否播报"已添加图库"。只有真的新加了图库目录才该播；
+        /// 刷新 / 粘贴入库 / 批量入库这些走同一条加载流程，谎报会误导用户。
+        /// </param>
+        public void ReloadWithProgress(string focusPath, bool announceAdd = false)
         {
             if (_config == null || _index == null) return;
 
-            // 用宿主窗体（无边框的 LibraryForm）当模态对话框的宿主，比拿 UserControl 更稳
+            // 用宿主窗体（无边框的 LibraryForm）当模态对话框的宿主，比拿 UserControl 更稳。
+            // 注意：Form.Visible 在最小化时依然是 true，必须再判 WindowState，
+            // 否则进度框会以一个最小化窗口为宿主，定位到屏幕外。
             IWin32Window owner = null;
             Form host = FindForm();
-            if (host != null && host.Visible) owner = host;
+            if (host != null && host.Visible && host.WindowState != FormWindowState.Minimized)
+                owner = host;
 
             // 延迟 450ms 才显示窗体：小图库扫得快，根本不会看到进度条，也不会闪
-            ProgressForm form = ProgressForm.Run(owner, "正在加载图库", "正在扫描图块文件，请稍候…", 450,
+            using (ProgressForm form = ProgressForm.Run(owner, "正在加载图库", "正在扫描图块文件，请稍候…", 450,
                 delegate (ProgressForm.ProgressReport report, ProgressForm.CancelQuery isCancelled)
                 {
                     _index.Reload(
                         delegate (int percent, string text) { report(percent, text); },
                         delegate { return isCancelled(); });
-                });
-
-            // 回到主线程：_index 已经就绪，重建树和列表
-            RebuildAfterScan(focusPath);
-
-            if (form.Error != null)
+                }))
             {
-                SetStatus("扫描出错：" + form.Error.Message);
+                // 回到主线程：_index 已经就绪，重建树和列表
+                RebuildAfterScan(focusPath);
+
+                if (form.Error != null)
+                {
+                    SetStatus("扫描出错：" + form.Error.Message);
+                    return;
+                }
+
+                if (form.Cancelled || _index.ScanCancelled)
+                {
+                    SetStatus("已取消加载，只加载了部分目录（点“刷新”可重新完整加载）。");
+                    return;
+                }
+            }
+
+            if (announceAdd)
+            {
+                CategoryNode added = string.IsNullOrEmpty(focusPath) ? null : _index.FindNodeByPath(focusPath);
+                if (added != null)
+                    SetStatus("已添加图库：" + added.FullPath + "（含子目录共 " + added.TotalCount + " 个图块）");
+                else
+                    SetStatus("已添加图库：" + focusPath + "（该目录内暂无图块文件）");
                 return;
             }
 
-            if (form.Cancelled || _index.ScanCancelled)
-            {
-                SetStatus("已取消加载，只加载了部分目录（点“刷新”可重新完整加载）。");
-                return;
-            }
-
-            CategoryNode added = string.IsNullOrEmpty(focusPath) ? null : _index.FindNodeByPath(focusPath);
-            if (added != null)
-                SetStatus("已添加图库：" + added.FullPath + "（含子目录共 " + added.TotalCount + " 个图块）");
-            else
-                SetStatus("已添加图库：" + focusPath + "（该目录内暂无图块文件）");
+            // 普通刷新：报"当前显示多少个图块"，不要谎报"已添加图库"
+            if (_currentBlocks != null)
+                SetStatus("图库已刷新，当前显示 " + _currentBlocks.Count + " 个图块。");
         }
 
         /// <summary>扫描结束后重建分类树与右侧列表（必须在主线程调用）。</summary>
@@ -138,6 +155,28 @@ namespace BlockLibraryManager
 
         // ---------------- 分类树 ----------------
 
+        /// <summary>清掉"此电脑"分支逐目录缓存的图标，避免 ImageList 无上限增长。</summary>
+        private void ClearPcIcons()
+        {
+            if (_treeIcons == null) return;
+
+            try
+            {
+                List<string> stale = new List<string>();
+                foreach (string key in _treeIcons.Images.Keys)
+                {
+                    if (!string.IsNullOrEmpty(key) && key.StartsWith("p:", StringComparison.Ordinal))
+                        stale.Add(key);
+                }
+
+                foreach (string key in stale) _treeIcons.Images.RemoveByKey(key);
+            }
+            catch
+            {
+                // 清不掉最多是多占点内存，树本身照常
+            }
+        }
+
         private void BuildTree()
         {
             if (_tree == null) return;
@@ -146,6 +185,10 @@ namespace BlockLibraryManager
             try
             {
                 _tree.Nodes.Clear();
+
+                // "此电脑"分支每展开一个目录就往 ImageList 塞一张图标（键以 "p:" 开头），
+                // 树是重建了但图标一直没清——翻盘翻久了会攒下成百上千张用不到的位图。
+                ClearPcIcons();
 
                 CategoryNode root = _index.Root;
 
@@ -382,71 +425,10 @@ namespace BlockLibraryManager
             return node.FullPath;
         }
 
-        /// <summary>
-        /// 取用于显示的缩略图：动态块在右上角画红色矢量闪电角标（缩小一半、
-        /// 紧贴右上角，带白色描边保证深色缩略图上醒目）；
-        /// 非动态块直接返回缓存原图（共享缓存不能就地修改）。
-        /// </summary>
-        private Image CreateDisplayImage(BlockItem item)
-        {
-            Image img = _thumbnails.GetThumbnail(item);
-            if (img == null) return null;
-            if (!_thumbnails.IsDynamicBlock(item)) return img;
-
-            try
-            {
-                Bitmap bmp = new Bitmap(img);
-                using (Graphics g = Graphics.FromImage(bmp))
-                {
-                    // 右上角闪电角标：手绘矢量闪电（细长锐利样式），
-                    // 无底色、无边框，大小为原来的 0.5 倍，紧贴右上角
-                    float s = Math.Max(8f, Math.Min(bmp.Width, bmp.Height) / 8.4f);
-                    float boltW = s * 0.72f;
-                    float x0 = bmp.Width - boltW - 2f;   // 右缘留 2px
-                    float y0 = 2f;                       // 顶缘留 2px
-
-                    // 闪电轮廓（归一化坐标，y 向下）：经典双折线闪电
-                    PointF[] bolt = new PointF[]
-                    {
-                        new PointF(x0 + 0.90f * boltW, y0),                 // 顶端右上
-                        new PointF(x0 + 0.08f * boltW, y0 + 0.58f * s),     // 左下斜边
-                        new PointF(x0 + 0.52f * boltW, y0 + 0.58f * s),     // 中部右折
-                        new PointF(x0 + 0.34f * boltW, y0 + s),             // 底尖
-                        new PointF(x0 + 0.94f * boltW, y0 + 0.40f * s),     // 右上斜边
-                        new PointF(x0 + 0.50f * boltW, y0 + 0.40f * s),     // 中部左折
-                    };
-
-                    using (GraphicsPath path = new GraphicsPath())
-                    {
-                        path.AddPolygon(bolt);
-
-                        // 白色描边底影：在黑色/深色缩略图上也清晰可见
-                        using (Pen halo = new Pen(Color.White, Math.Max(1.2f, s / 12f)))
-                        {
-                            halo.LineJoin = LineJoin.Round;
-                            g.DrawPath(halo, path);
-                        }
-
-                        using (SolidBrush red = new SolidBrush(Color.Red))
-                            g.FillPath(red, path);
-                    }
-
-                    // 可见性动态块：底部中央画"朝左 / 朝右"两个三角形按钮，
-                    // 点击分别切换到上一个 / 下一个可见性状态并同步重生成缩略图
-                    List<string> visStates = _thumbnails.GetVisibilityStates(item);
-                    if (visStates != null && visStates.Count >= 2)
-                    {
-                        DrawTriangleButton(g, GetPrevTriangleRect(bmp.Width, bmp.Height), true);
-                        DrawTriangleButton(g, GetNextTriangleRect(bmp.Width, bmp.Height), false);
-                    }
-                }
-                return bmp;
-            }
-            catch
-            {
-                return img;   // 角标画不出来就显示原图
-            }
-        }
+        // 注：原来的 CreateDisplayImage（把动态块角标"烤"进一张复制出来的 Bitmap）
+        // 已删除。自绘之后角标改成绘制期叠加，见 LibraryControl.Draw.cs 的
+        // DrawItemOverlays / DrawDynamicBadge —— 零拷贝，也不再需要
+        // ImageList 的反复增删。
 
         /// <summary>
         /// 可见性切换的一对三角形按钮在缩略图（或图标矩形）里的整体范围：底部居中。
@@ -556,6 +538,10 @@ namespace BlockLibraryManager
                 hit.Item.Focused = true;
 
                 _thumbnails.CycleVisibilityThumbnail(item, prevHit ? -1 : 1);
+
+                // 切换是同步完成的（没有排队），这里立刻把重绘刷出去，
+                // 不用等下一次空闲，点一下三角形按钮缩略图就跟着换
+                FlushListPaint();
             }
             catch
             {
@@ -569,19 +555,13 @@ namespace BlockLibraryManager
 
             _currentBlocks = items ?? new List<BlockItem>();
             _itemMap.Clear();
+            ResetVisibleStamp();
 
-            // 不要每次刷新都把 ImageList 全清再全量重塞：
-            // 上千条时那是最慢的一步。这里只补缺失的图，
-            // 只有当图片数明显超过当前需要时才做一次清理，防止无限增长。
-            try
-            {
-                if (_imageList.Images.Count > _currentBlocks.Count * 2 + 200)
-                    _imageList.Images.Clear();
-            }
-            catch
-            {
-                // 清不掉就算了，不影响显示
-            }
+            // 自绘之后这里**完全不碰 ImageList**：
+            // 以前每加一项都要 CreateDisplayImage + Images.Add（把一整张缩略图塞进
+            // ImageList），几千项时就是几千次位图转换，是刷新列表最慢的一步。
+            // 现在只建 ListViewItem，图由绘制事件按需去缓存取，屏幕外的项根本不取。
+            EnsurePlaceholderImage();
 
             // 本轮需要生成多少张缩略图（RequestThumbnails 现在只登记，不再同步解码 PNG）
             int requested = 0;
@@ -591,24 +571,30 @@ namespace BlockLibraryManager
             {
                 _list.Items.Clear();
 
-                foreach (BlockItem item in _currentBlocks)
+                int count = _currentBlocks.Count;
+                if (count > 0)
                 {
-                    string key = item.Key;
+                    // 一次性 AddRange 比逐条 Add 快得多（少发几千次原生通知）
+                    ListViewItem[] buffer = new ListViewItem[count];
 
-                    if (!_imageList.Images.ContainsKey(key))
-                        _imageList.Images.Add(key, CreateDisplayImage(item));
+                    for (int i = 0; i < count; i++)
+                    {
+                        BlockItem item = _currentBlocks[i];
 
-                    ListViewItem lvi = new ListViewItem(item.Name);
-                    lvi.ImageKey = key;
-                    lvi.Tag = item;
-                    lvi.ToolTipText = item.FilePath;
+                        ListViewItem lvi = new ListViewItem(item.Name);
+                        lvi.ImageIndex = 0;          // 指向那张占位图，只为撑出图标尺寸
+                        lvi.Tag = item;
+                        lvi.ToolTipText = item.FilePath;
 
-                    lvi.SubItems.Add(FormatSize(item.FileSize));
-                    lvi.SubItems.Add(FormatTime(item.ModifiedTime));
-                    lvi.SubItems.Add(item.CategoryPath);
+                        lvi.SubItems.Add(FormatSize(item.FileSize));
+                        lvi.SubItems.Add(FormatTime(item.ModifiedTime));
+                        lvi.SubItems.Add(item.CategoryPath);
 
-                    _list.Items.Add(lvi);
-                    _itemMap[key] = lvi;
+                        buffer[i] = lvi;
+                        _itemMap[item.Key] = lvi;
+                    }
+
+                    _list.Items.AddRange(buffer);
                 }
             }
             finally
@@ -639,34 +625,16 @@ namespace BlockLibraryManager
 
             _thumbDone++;
 
-            try
-            {
-                ListViewItem lvi;
-                if (!_itemMap.TryGetValue(item.Key, out lvi)) return;
-                if (lvi.ListView == null) return;
-
-                BeginInvoke(new Action(delegate
-                {
-                    try
-                    {
-                        Image img = CreateDisplayImage(item);
-                        if (img == null) return;
-
-                        string key = item.Key;
-                        if (_imageList.Images.ContainsKey(key))
-                            _imageList.Images.RemoveByKey(key);
-
-                        _imageList.Images.Add(key, img);
-                        lvi.ImageKey = key;
-                        _list.Invalidate();
-                    }
-                    catch { }
-                }));
-            }
-            catch
-            {
-                // 面板正在关闭时忽略
-            }
+            // 自绘之后这里几乎什么都不用做：图已经进内存缓存，
+            // 绘制事件自己会去取，屏幕外的项压根不会取。
+            //
+            // 原来这里是"CreateDisplayImage → RemoveByKey → Add → 每条 BeginInvoke"，
+            // 三个问题：
+            //   1. 每条都 BeginInvoke，生成 2000 张就排 2000 个 UI 消息，界面被自己拖住；
+            //   2. RemoveByKey + Add 会让 ImageList 里后面所有项的索引整体错位；
+            //   3. 每个动态块都要复制一张 Bitmap 把角标烤进去。
+            // 现在只打个脏标记，由空闲处理每帧统一刷一次重绘。
+            _listDirty = true;
         }
 
         internal static string FormatSize(long bytes)
@@ -721,9 +689,10 @@ namespace BlockLibraryManager
             options.ScaleZ = x;
             options.UniformScale = true;
 
-            double rotation = ParseDouble(_txtRotation.Text, 0.0);
-            if (double.IsNaN(rotation) || double.IsInfinity(rotation)) rotation = 0.0;
-            options.RotationDegrees = rotation;
+            // 旋转角度（v1.51.2）：面板上的角度输入框已按用户要求移除。
+            // 默认 0 度（不旋转）；插入时的两段式 Jig 交互保留 —— 单击定插入点后
+            // 仍可移动鼠标转角度、单击固定，回车 = 0 度（默认角度）。
+            options.RotationDegrees = 0.0;
 
             // 炸开：勾选后插入时分解为基本图元（默认不勾选）
             options.ExplodeAfterInsert = _chkExplode != null && _chkExplode.Checked;
@@ -785,11 +754,15 @@ namespace BlockLibraryManager
                 return;
             }
 
-            // 命令已成功排队：先把面板最小化，把图形窗口让出来；
-            // 插入完成后由 BLOCKLIBIN 回调 LibraryPalette.Restore() 还原窗口。
-            try { LibraryPalette.Minimize(); } catch { }
+            // 命令已成功排队：把面板临时收起，让出图形窗口；
+            // 插入完成后由 BLOCKLIBIN 回调 LibraryPalette.Restore() 原样还原。
+            // 用 PushAside 而不是 Minimize：最小化后的窗口可能藏在 CAD 主窗口后面
+            // 或缩在任务栏里，万一收尾回调没走到就再也找不回来了。
+            try { LibraryPalette.PushAside(); } catch { }
 
-            SetStatus(continuous ? "连续插入：依次指定插入点，按 Esc 结束。" : "请在图形窗口中指定插入点…");
+            SetStatus(continuous
+                ? "连续插入：单击定插入点，再移动鼠标定角度后单击固定；按 Esc 结束。"
+                : "请在图形窗口单击指定插入点，再移动鼠标确定旋转角度后单击固定…");
         }
 
         private static bool TrySendCommand(string commandText, out string message)
@@ -819,10 +792,23 @@ namespace BlockLibraryManager
         }
 
         /// <summary>由命令 BLOCKLIBIN 回调，用于在面板上显示结果。
-        /// 插入操作结束后把最小化的面板自动还原（原大小）并带回前台。</summary>
+        /// 插入操作结束后把最小化的面板自动还原（原大小）并带回前台；
+        /// 若参数面板勾选了"插入图形后关闭窗口"且插入成功，则改为直接收起窗口。</summary>
         internal void ReportInsertResult(IList<BlockItem> items, string message, bool succeeded)
         {
-            try { LibraryPalette.Restore(); } catch { }
+            // 右键菜单里那个一次性的"插入图形后关闭"已经移除，
+            // 现在只看参数面板第 6 行的勾选（状态已持久化进 BlockLibrary.ini）。
+            bool closeAfterInsert = _chkCloseAfter != null && _chkCloseAfter.Checked;
+
+            if (closeAfterInsert && succeeded)
+            {
+                // 插入成功 → 收起图库管理器窗口（保留浏览状态，下次 BLOCKLIB 原样唤起）
+                try { LibraryPalette.Hide(); } catch { }
+            }
+            else
+            {
+                try { LibraryPalette.Restore(); } catch { }
+            }
 
             SetStatus(message);
 

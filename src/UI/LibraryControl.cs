@@ -90,8 +90,6 @@ namespace BlockLibraryManager
         private Panel _bottomPanel;
         private Label _lblScale;
         private TextBox _txtScaleX;
-        private Label _lblRotation;
-        private TextBox _txtRotation;
         private CheckBox _chkExplode;
         private CheckBox _chkUpdateDef;
         private Label _lblHint;
@@ -130,6 +128,11 @@ namespace BlockLibraryManager
         private Label _lblColorHint;
         private Label _lblExplodeHint;
 
+        /// <summary>"插入图形后关闭窗口"行：勾选后每次插入成功自动收起图库窗口（配置持久化）。</summary>
+        private CheckBox _chkCloseAfter;
+        private Label _lblCloseName;
+        private Label _lblCloseHint;
+
         /// <summary>图层/颜色/分解行的参数名文字（与勾选框分开，保证各行值列对齐）。</summary>
         private Label _lblLayerName;
         private Label _lblColorName;
@@ -146,6 +149,9 @@ namespace BlockLibraryManager
         /// <summary>本轮已经生成好的缩略图数量。</summary>
         private int _thumbDone;
 
+        /// <summary>本轮的"已全部生成"提示是否已经播过（避免每帧重复刷状态栏）。</summary>
+        private bool _thumbRoundAnnounced;
+
         private ContextMenuStrip _menuList;
         private ContextMenuStrip _menuTree;
         private ToolStripMenuItem _miTreeOpenFolder;
@@ -159,6 +165,10 @@ namespace BlockLibraryManager
 
         /// <summary>右侧列表右键菜单里的"粘贴入库"项。</summary>
         private ToolStripMenuItem _miListPaste;
+
+        /// <summary>右侧列表右键菜单里的"重命名块"项：修改选中图块的 DWG 文件名。</summary>
+        private ToolStripMenuItem _miListRename;
+        private ToolStripMenuItem _miListOpenDrawing;
 
         /// <summary>右侧列表右键菜单里的"白底缩略图 / 黑底缩略图"切换项。</summary>
         private ToolStripMenuItem _miThumbWhite;
@@ -318,10 +328,14 @@ namespace BlockLibraryManager
                 if (_paramTitleLabel != null)
                     _paramTitleLabel.Text = L.T("插入参数设置", "Insert Parameters");
                 if (_lblScale != null) _lblScale.Text = L.T("插入比例", "Insert Scale");
-                if (_lblRotation != null) _lblRotation.Text = L.T("旋转角度", "Rotation");
                 if (_lblLayerName != null) _lblLayerName.Text = L.T("图层为0", "Layer 0");
                 if (_lblColorName != null) _lblColorName.Text = L.T("颜色跟随层", "Color by Layer");
                 if (_lblExplodeName != null) _lblExplodeName.Text = L.T("插入后分解图块", "Explode on Insert");
+                if (_lblCloseName != null)
+                    _lblCloseName.Text = L.T("插入图形后关闭窗口", "Close Panel After Insert");
+                if (_lblCloseHint != null)
+                    _lblCloseHint.Text = L.T("—— 勾选后插入成功自动关闭图库管理器窗口",
+                        "— checked: close the panel automatically after a successful insert");
                 if (_chkLayerZero != null) _chkLayerZero.Text = string.Empty;
                 if (_chkColorByLayer != null) _chkColorByLayer.Text = string.Empty;
                 if (_chkExplode != null) _chkExplode.Text = string.Empty;
@@ -396,23 +410,109 @@ namespace BlockLibraryManager
         {
             if (_thumbnails == null) return false;
 
+            // 面板已关闭 / 最小化：后台不做任何事，把 AutoCAD 主线程完整还给用户
+            if (_thumbnails.IsSuspended) return false;
+
+            // 先按"当前屏幕可见区间"把队列重排一次（区间没变就直接返回），
+            // 保证后台一直在做用户马上要看的那几张，而不是闷头从头做到尾。
+            PrioritizeVisibleThumbnails();
+
+            // 刚才那批缩略图的重绘请求在这里一次性刷出去
+            FlushListPaint();
+
             if (_thumbnails.PendingCount <= 0)
             {
                 HideThumbProgress();
                 return false;
             }
 
-            bool more = _thumbnails.ProcessQueue(4);
-            UpdateThumbProgress();
+            bool more = _thumbnails.ProcessQueue(6);
 
-            if (!more)
+            // 缩略图本体出完就可以收进度条——剩下的"动态块 / 可见性"补测只是角标，
+            // 不该让进度条一直挂在那儿（也不能每帧 UpdateThumbProgress 把刚藏起来的
+            // 进度条又拉回来）。结束提示每轮只播一次，免得反复刷状态栏。
+            if (!_thumbnails.HasPendingThumbnails)
+            {
+                HideThumbProgress();
+
+                if (!_thumbRoundAnnounced)
+                {
+                    _thumbRoundAnnounced = true;
+
+                    // 播报真实完成数：重试用尽的条目不会再有进度，不能拿请求数冒充
+                    if (_thumbDone >= _thumbTotal)
+                        SetStatus("缩略图已全部生成，共 " + _thumbTotal + " 张。");
+                    else
+                        SetStatus("缩略图已生成 " + _thumbDone + " 张，另有 " +
+                                  (_thumbTotal - _thumbDone) + " 张无法生成（已显示占位图）。");
+                }
+            }
+            else
             {
                 UpdateThumbProgress();
-                HideThumbProgress();
-                SetStatus("缩略图已全部生成，共 " + _thumbTotal + " 张。");
             }
 
             return more;
+        }
+
+        /// <summary>
+        /// 面板不再可见（关闭 / 最小化）时调用：立刻停止后台缩略图的生成与缓存。
+        ///
+        /// 为什么必须显式停：缩略图是挂在 AutoCAD 的 Application.Idle 上分批做的，
+        /// 每批最多占用 ~40ms 主线程去打开 DWG、解码、重采样。面板都关了还在跑，
+        /// 用户就会感觉"关掉图库之后 CAD 一直卡"——队列里攒着几千张图时尤其明显。
+        /// 这里清空队列，Idle 回调随即空转，主线程立刻还给用户。
+        /// </summary>
+        public void SuspendThumbnailWork()
+        {
+            if (_thumbnails == null) return;
+
+            try
+            {
+                _thumbnails.Suspend();
+
+                // 可见区间作废：下次显示时重新按视口排优先级
+                ResetVisibleStamp();
+
+                // 隐藏期间攒下的重绘请求一并作废（界面看不见，刷了也白刷）
+                _listDirty = false;
+
+                HideThumbProgress();
+            }
+            catch
+            {
+                // 暂停失败不影响窗口正常关闭
+            }
+        }
+
+        /// <summary>
+        /// 面板重新可见时调用：恢复后台生成，并把当前列表里还缺图的条目重新排队。
+        /// 已在内存缓存里的条目会被 RequestThumbnails 自动跳过，所以恢复不会重复劳动。
+        /// </summary>
+        public void ResumeThumbnailWork()
+        {
+            if (_thumbnails == null) return;
+
+            try
+            {
+                _thumbnails.Resume();
+                ResetVisibleStamp();
+
+                if (_currentBlocks == null || _currentBlocks.Count == 0) return;
+
+                int requested = _thumbnails.RequestThumbnails(_currentBlocks);
+                BeginThumbRound(requested);
+            }
+            catch
+            {
+                // 恢复失败最多是缩略图不出来，不影响正常使用
+            }
+        }
+
+        /// <summary>后台缩略图工作当前是否处于暂停状态。</summary>
+        public bool ThumbnailWorkSuspended
+        {
+            get { return _thumbnails != null && _thumbnails.IsSuspended; }
         }
 
         // ---------------- 缩略图生成进度条 ----------------
@@ -422,6 +522,7 @@ namespace BlockLibraryManager
         {
             _thumbTotal = Math.Max(0, requested);
             _thumbDone = 0;
+            _thumbRoundAnnounced = false;
             UpdateThumbProgress();
         }
 
@@ -433,16 +534,28 @@ namespace BlockLibraryManager
             int done = _thumbDone;
             if (done > _thumbTotal) done = _thumbTotal;
 
+            // 本轮计数走完就收掉进度条。不能一直挂着 568/599：
+            // 剩下的是"重试用尽、无法生成"的条目，它们不会再有进度了。
+            if (done >= _thumbTotal)
+            {
+                HideThumbProgress();
+                return;
+            }
+
             try
             {
                 int percent = (int)(done * 100L / _thumbTotal);
                 if (percent < 0) percent = 0;
                 if (percent > 100) percent = 100;
 
-                _lblThumbInfo.Text = "缩略图 " + done + "/" + _thumbTotal;
-                _lblThumbInfo.Visible = true;
-                _pbThumbs.Visible = true;
-                _pbThumbs.Value = percent;
+                // 值没变就不碰控件（v1.49.1）：空闲循环每帧都会走到这里，
+                // 反复设置相同的文本 / 可见性 / 进度值会让右下角这块区域
+                // 不停重绘、看起来像在闪。
+                string text = "缩略图 " + done + "/" + _thumbTotal;
+                if (_lblThumbInfo.Text != text) _lblThumbInfo.Text = text;
+                if (!_lblThumbInfo.Visible) _lblThumbInfo.Visible = true;
+                if (!_pbThumbs.Visible) _pbThumbs.Visible = true;
+                if (_pbThumbs.Value != percent) _pbThumbs.Value = percent;
             }
             catch
             {
@@ -541,8 +654,8 @@ namespace BlockLibraryManager
         {
             return L.T("点击切换界面整体配色（当前：", "Click to switch the UI color scheme (current: ") +
                    CurrentThemeName() +
-                   L.T("；共 " + UiThemes.All.Length + " 种：默认 / 清新蓝 / 薄荷绿 / 浅绿 / 暖阳橙）",
-                       "; " + UiThemes.All.Length + " in total: Default / Fresh Blue / Mint Green / Light Green / Warm Sun)");
+                   L.T("；共 " + UiThemes.All.Length + " 种：默认 / 清新蓝 / 薄荷绿 / 深黑灰 / 暖阳橙）",
+                       "; " + UiThemes.All.Length + " in total: Default / Fresh Blue / Mint Green / Dark Gray / Warm Sun)");
         }
 
         /// <summary>工具栏"主题"按钮：循环切换 界面整体配色，选择记忆到配置。</summary>
@@ -821,14 +934,14 @@ namespace BlockLibraryManager
             return host;
         }
 
-        /// <summary>给搜索面板画一圈浅色边框，看起来就是一个输入框。</summary>
+        /// <summary>给搜索面板画一圈边框（颜色跟随主题，深色主题下自动换成中灰）。</summary>
         private void OnSearchPanelPaint(object sender, PaintEventArgs e)
         {
             try
             {
                 Panel p = sender as Panel;
                 if (p == null) return;
-                using (Pen pen = new Pen(Color.FromArgb(173, 178, 189)))
+                using (Pen pen = new Pen(CurrentTheme.Border))
                     e.Graphics.DrawRectangle(pen, 0, 0, p.Width - 1, p.Height - 1);
             }
             catch
@@ -939,6 +1052,17 @@ namespace BlockLibraryManager
             _list.LabelEdit = false;
             _list.AllowDrop = true;
             _list.Sorting = SortOrder.None;
+
+            // ★ 自绘：缩略图不再逐项塞进 ImageList，而是"谁要被画出来才取谁的图"。
+            //   详见 UI/LibraryControl.Draw.cs 的头部说明。
+            _list.OwnerDraw = true;
+            _list.DrawItem += new DrawListViewItemEventHandler(OnListDrawItem);
+            _list.DrawSubItem += new DrawListViewSubItemEventHandler(OnListDrawSubItem);
+            _list.DrawColumnHeader += new DrawListViewColumnHeaderEventHandler(OnListDrawColumnHeader);
+
+            // 自绘不开双缓冲会明显闪
+            SetDoubleBuffered(_list, true);
+
             _list.DoubleClick += new EventHandler(OnListDoubleClick);
             _list.ItemDrag += new ItemDragEventHandler(OnListItemDrag);
             _list.DragEnter += new DragEventHandler(OnListDragEnter);
@@ -1015,11 +1139,19 @@ namespace BlockLibraryManager
             insert.Click += new EventHandler(OnInsertSelectedClick);
             _menuList.Items.Add(insert);
 
+            // 说明：原先这里还有一项"插入图形后关闭"，已移除——
+            // 插入参数面板第 6 行"插入图形后关闭窗口"勾选框就是同一个功能，且会写进配置持久化。
+
             ToolStripMenuItem addRecursion = new ToolStripMenuItem("插入多个（连续）");
             addRecursion.Click += new EventHandler(OnInsertMultipleClick);
             _menuList.Items.Add(addRecursion);
 
             _menuList.Items.Add(new ToolStripSeparator());
+
+            // 打开该图形文件：用当前 CAD 打开选中的 DWG，并自动收起图库管理器
+            _miListOpenDrawing = new ToolStripMenuItem("打开该图形文件");
+            _miListOpenDrawing.Click += new EventHandler(OnOpenDrawingClick);
+            _menuList.Items.Add(_miListOpenDrawing);
 
             ToolStripMenuItem openFolder = new ToolStripMenuItem("打开所在文件夹");
             openFolder.Click += new EventHandler(OnOpenFolderClick);
@@ -1035,6 +1167,11 @@ namespace BlockLibraryManager
             _miListPaste = new ToolStripMenuItem("粘贴入库");
             _miListPaste.Click += new EventHandler(OnPasteIntoLibraryClick);
             _menuList.Items.Add(_miListPaste);
+
+            // 重命名块：修改选中图块的 DWG 文件名（在"粘贴入库"与"刷新"之间）
+            _miListRename = new ToolStripMenuItem("重命名块");
+            _miListRename.Click += new EventHandler(OnRenameBlockClick);
+            _menuList.Items.Add(_miListRename);
 
             ToolStripMenuItem refresh = new ToolStripMenuItem("刷新");
             refresh.Click += new EventHandler(OnRefreshClick);
@@ -1136,9 +1273,9 @@ namespace BlockLibraryManager
         ///   标题栏（颜色样式与"目录列表"标题栏一致）：左侧标题文字，右上角 × 关闭按钮
         ///   参数行两列布局（左参数名 / 右值），各占一行：
         ///     插入比例   1:X（X 由用户输入，默认 1）
-        ///     旋转角度   默认 0，可自行输入
         ///     图层       勾选后插入的图块归到 0 图层；不勾选使用图块所在图层
         ///     颜色       勾选后图块颜色跟随图层颜色；不勾选保持图块原有颜色
+        ///   （旋转角度输入行已在 v1.51.2 移除；插入默认 0 度，Jig 交互旋转保留）
         /// </summary>
         private void CreateParamPanel()
         {
@@ -1160,8 +1297,19 @@ namespace BlockLibraryManager
             title.ForeColor = SystemColors.ControlText;
             title.BackColor = SystemColors.Control;
             title.AutoSize = true;
-            title.Location = new Point(8, 9);
             _paramTitleLabel = title;
+
+            // 标题落在标题栏的"左中"位置：x 固定靠左，y 按实测文字高度垂直居中
+            //（不再写死 y=9，任何 DPI / 字号下都居中）
+            EventHandler placeTitle = delegate
+            {
+                try
+                {
+                    title.Location = new Point(8,
+                        Math.Max(2, (_paramHeaderPanel.ClientSize.Height - title.Height) / 2));
+                }
+                catch { }
+            };
 
             Button close = new Button();
             close.Text = "×";
@@ -1179,7 +1327,7 @@ namespace BlockLibraryManager
             _paramHeaderPanel.Controls.Add(title);
             _paramHeaderPanel.Controls.Add(close);
 
-            // 关闭按钮始终贴右上角
+            // 关闭按钮贴右上角；标题文字随高度变化保持垂直居中
             EventHandler placeClose = delegate
             {
                 try
@@ -1187,10 +1335,12 @@ namespace BlockLibraryManager
                     close.Location = new Point(
                         _paramHeaderPanel.ClientSize.Width - close.Width - 4,
                         (_paramHeaderPanel.ClientSize.Height - close.Height) / 2);
+                    placeTitle(null, EventArgs.Empty);
                 }
                 catch { }
             };
             _paramHeaderPanel.Resize += placeClose;
+            _paramHeaderPanel.HandleCreated += delegate { placeClose(null, EventArgs.Empty); };
             placeClose(null, EventArgs.Empty);
 
             // ---- 参数行控件 ----
@@ -1211,18 +1361,8 @@ namespace BlockLibraryManager
             _txtScaleX.Text = "1";
             _txtScaleX.BorderStyle = BorderStyle.FixedSingle;
 
-            _lblRotation = new Label();
-            _lblRotation.Text = L.T("旋转角度", "Rotation");
-            _lblRotation.AutoSize = true;
-            _lblRotation.BackColor = SystemColors.Control;
-
-            _txtRotation = new TextBox();
-            _txtRotation.Width = 44;
-            _txtRotation.Text = "0";
-            _txtRotation.BorderStyle = BorderStyle.FixedSingle;
-
             // 图层 / 颜色 / 分解：参数名与勾选框分成两个控件，
-            // 名字列与"插入比例/旋转角度"左对齐，勾选框统一落在值列上，各行整齐对齐
+            // 名字列与"插入比例"左对齐，勾选框统一落在值列上，各行整齐对齐
             _chkLayerZero = new CheckBox();
             _chkLayerZero.Text = string.Empty;
             _chkLayerZero.AutoSize = false;
@@ -1283,6 +1423,28 @@ namespace BlockLibraryManager
             _lblExplodeHint.TextAlign = ContentAlignment.MiddleLeft;
             _lblExplodeHint.AutoEllipsis = true;
 
+            // 行6：插入图形后关闭窗口（勾选后每次插入成功自动收起图库窗口，配置持久化）
+            _chkCloseAfter = new CheckBox();
+            _chkCloseAfter.Text = string.Empty;
+            _chkCloseAfter.AutoSize = false;
+            _chkCloseAfter.Size = new Size(20, 18);
+            _chkCloseAfter.BackColor = SystemColors.Control;
+            _chkCloseAfter.TabStop = false;
+            _chkCloseAfter.CheckedChanged += new EventHandler(OnCloseAfterCheckedChanged);
+
+            _lblCloseName = new Label();
+            _lblCloseName.Text = L.T("插入图形后关闭窗口", "Close Panel After Insert");
+            _lblCloseName.AutoSize = true;
+            _lblCloseName.BackColor = SystemColors.Control;
+
+            _lblCloseHint = new Label();
+            _lblCloseHint.Text = L.T("—— 勾选后插入成功自动关闭图库管理器窗口",
+                "— checked: close the panel automatically after a successful insert");
+            _lblCloseHint.ForeColor = Color.DimGray;
+            _lblCloseHint.BackColor = SystemColors.Control;
+            _lblCloseHint.TextAlign = ContentAlignment.MiddleLeft;
+            _lblCloseHint.AutoEllipsis = true;
+
             // CheckBox 没有自带的 ToolTipText，用 ToolTip 组件悬浮说明
             _paramTips = new ToolTip();
             _paramTips.SetToolTip(_chkLayerZero,
@@ -1294,11 +1456,12 @@ namespace BlockLibraryManager
             _paramTips.SetToolTip(_chkExplode,
                 L.T("勾选：插入时把图块分解为基本图元；不勾选：保持为整体图块",
                     "Checked: explode the block into basic entities on insert; unchecked: insert as a block"));
+            _paramTips.SetToolTip(_chkCloseAfter,
+                L.T("勾选：每次插入成功后自动关闭图库管理器窗口；不勾选：插入后窗口自动还原",
+                    "Checked: close the panel automatically after each successful insert; unchecked: restore the panel after insert"));
 
             _paramPanel.Controls.Add(_lblScale);
             _paramPanel.Controls.Add(_txtScaleX);
-            _paramPanel.Controls.Add(_lblRotation);
-            _paramPanel.Controls.Add(_txtRotation);
             _paramPanel.Controls.Add(_lblLayerName);
             _paramPanel.Controls.Add(_chkLayerZero);
             _paramPanel.Controls.Add(_lblLayerHint);
@@ -1308,6 +1471,9 @@ namespace BlockLibraryManager
             _paramPanel.Controls.Add(_lblExplodeName);
             _paramPanel.Controls.Add(_chkExplode);
             _paramPanel.Controls.Add(_lblExplodeHint);
+            _paramPanel.Controls.Add(_lblCloseName);
+            _paramPanel.Controls.Add(_chkCloseAfter);
+            _paramPanel.Controls.Add(_lblCloseHint);
 
             // 面板宽度变化时提示文字宽度要跟着变
             _paramPanel.Resize += new EventHandler(delegate (object s, EventArgs e) { LayoutParamPanel(); });
@@ -1358,13 +1524,7 @@ namespace BlockLibraryManager
                 // 勾选框统一右对齐到"插入比例"输入框的右边缘
                 int chkRight = _txtScaleX.Right;
 
-                // 行2：旋转角度（输入框与比例输入框等长、右对齐）
-                row += ParamRowHeight;
-                _lblRotation.Location = new Point(labelX, row + 3);
-                _txtRotation.Size = new Size(_txtScaleX.Width, _txtScaleX.Height);
-                _txtRotation.Location = new Point(_txtScaleX.Left, row);
-
-                // 行3：图层为0（勾选框与参数名文字同一水平中心线，且右对齐输入框）
+                // 行2：图层为0（勾选框与参数名文字同一水平中心线，且右对齐输入框）
                 row += ParamRowHeight;
                 _lblLayerName.Location = new Point(labelX, row + 3);
                 int center3 = _lblLayerName.Top + Math.Max(1, _lblLayerName.Height) / 2;
@@ -1373,7 +1533,7 @@ namespace BlockLibraryManager
                 _lblLayerHint.SetBounds(chkRight + 6, row + 3,
                     Math.Max(0, panelWidth - chkRight - 12), 18);
 
-                // 行4：颜色跟随层
+                // 行3：颜色跟随层
                 row += ParamRowHeight;
                 _lblColorName.Location = new Point(labelX, row + 3);
                 int center4 = _lblColorName.Top + Math.Max(1, _lblColorName.Height) / 2;
@@ -1382,13 +1542,22 @@ namespace BlockLibraryManager
                 _lblColorHint.SetBounds(chkRight + 6, row + 3,
                     Math.Max(0, panelWidth - chkRight - 12), 18);
 
-                // 行5：插入后分解图块
+                // 行4：插入后分解图块
                 row += ParamRowHeight;
                 _lblExplodeName.Location = new Point(labelX, row + 3);
                 int center5 = _lblExplodeName.Top + Math.Max(1, _lblExplodeName.Height) / 2;
                 _chkExplode.Location = new Point(chkRight - _chkExplode.Width,
                     center5 - _chkExplode.Height / 2);
                 _lblExplodeHint.SetBounds(chkRight + 6, row + 3,
+                    Math.Max(0, panelWidth - chkRight - 12), 18);
+
+                // 行5：插入图形后关闭窗口（勾选框与其余各行同一列对齐）
+                row += ParamRowHeight;
+                _lblCloseName.Location = new Point(labelX, row + 3);
+                int center6 = _lblCloseName.Top + Math.Max(1, _lblCloseName.Height) / 2;
+                _chkCloseAfter.Location = new Point(chkRight - _chkCloseAfter.Width,
+                    center6 - _chkCloseAfter.Height / 2);
+                _lblCloseHint.SetBounds(chkRight + 6, row + 3,
                     Math.Max(0, panelWidth - chkRight - 12), 18);
             }
             catch
@@ -1414,7 +1583,7 @@ namespace BlockLibraryManager
                 // 优先恢复上次记忆的位置；没保存过才默认平分高度
                 int half = _leftSplitDistance > 0 ? _leftSplitDistance : total / 2;
 
-                // 参数面板（Panel2）至少要能完整放下标题栏 + 5 行参数，不够就压缩目录树
+                // 参数面板（Panel2）至少要能完整放下标题栏 + 4 行参数，不够就压缩目录树
                 int max = total - splitter - ParamPanelMinHeight;
                 if (max < _leftSplit.Panel1MinSize) max = _leftSplit.Panel1MinSize;
 
@@ -1618,7 +1787,15 @@ namespace BlockLibraryManager
 
                 string[] dirs;
                 try { dirs = System.IO.Directory.GetDirectories(tag.Path); }
-                catch { return; }
+                catch (System.Exception ex)
+                {
+                    // 节点已经被清空了，直接走人会让"载入中…"占位符也不再回来，
+                    // 而这个分支的展开条件正是"还挂着占位符"——该目录从此再也展不开，
+                    // 界面上还没有任何提示。这里把占位符补回去并说明原因。
+                    AddPcDummy(node);
+                    SetStatus("无法访问该目录：" + tag.Path + "（" + ex.Message + "）");
+                    return;
+                }
 
                 List<string> visible = new List<string>();
                 foreach (string dir in dirs)
@@ -1680,10 +1857,20 @@ namespace BlockLibraryManager
                 _list.SmallImageList = null;
                 _list.LargeImageList = _imageList;
                 _list.SmallImageList = _imageList;
+
+                // 自绘之后 ImageList 里只需要一张透明占位图来撑尺寸
+                EnsurePlaceholderImage();
             }
             catch (System.Exception ex)
             {
                 BlmLog.Write("ApplyConfigToUi 缩略图尺寸 " + size + " 失败: " + ex.Message);
+            }
+
+            // 规格变了，占位图（"DWG" / "块"）必须按新尺寸重画
+            if (_thumbnails != null)
+            {
+                try { _thumbnails.DropPlaceholders(); }
+                catch { }
             }
 
             switch (_config.ViewMode)
@@ -1697,6 +1884,12 @@ namespace BlockLibraryManager
                 default:
                     _list.View = View.LargeIcon;
                     break;
+            }
+
+            // 恢复"插入图形后关闭窗口"的勾选状态（配置持久化）
+            if (_chkCloseAfter != null)
+            {
+                _chkCloseAfter.Checked = _config.InsertCloseAfter;
             }
 
             SetStatus("就绪。当前图库根目录 " + _config.RootPaths.Count + " 个。");
@@ -1809,6 +2002,23 @@ namespace BlockLibraryManager
                     _searchTimer.Stop();
                     _searchTimer.Dispose();
                     _searchTimer = null;
+                }
+
+                // 下面这几个不是子控件，base.Dispose 不会替我们释放
+                if (_paramTips != null)
+                {
+                    _paramTips.Dispose();
+                    _paramTips = null;
+                }
+                if (_menuList != null)
+                {
+                    _menuList.Dispose();
+                    _menuList = null;
+                }
+                if (_menuTree != null)
+                {
+                    _menuTree.Dispose();
+                    _menuTree = null;
                 }
             }
             base.Dispose(disposing);

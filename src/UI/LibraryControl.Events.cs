@@ -576,8 +576,8 @@ namespace BlockLibraryManager
             _config.AddRoot(chosen);
             _config.Save();
 
-            // 加进来之后要整盘扫描这个目录，用进度条把过程显示出来
-            ReloadWithProgress(chosen);
+            // 加进来之后要整盘扫描这个目录，用进度条把过程显示出来（这里才该播"已添加图库"）
+            ReloadWithProgress(chosen, true);
         }
 
         /// <summary>对话框的起始目录：优先用当前选中的分类，退回第一个图库根目录，最后是我的文档。</summary>
@@ -733,6 +733,26 @@ namespace BlockLibraryManager
                                    !string.IsNullOrEmpty(category.FullPath) &&
                                    !category.Missing;
 
+            BlockItem sel = GetSingleSelectedBlock();
+
+            // "打开该图形文件"：只在选中了磁盘上真实存在的 DWG 时可用
+            if (_miListOpenDrawing != null)
+            {
+                _miListOpenDrawing.Enabled = sel != null &&
+                    !string.IsNullOrEmpty(sel.FilePath) &&
+                    string.Equals(Path.GetExtension(sel.FilePath), ".dwg", StringComparison.OrdinalIgnoreCase) &&
+                    File.Exists(sel.FilePath);
+            }
+
+            // "重命名块"：只对"整份 DWG"的条目开放——DWG 内部块共享宿主文件，
+            // 改一个块的名字等于改整份图纸，不能在这里单独改名
+            if (_miListRename != null)
+            {
+                _miListRename.Enabled = sel != null && sel.IsWholeDrawing &&
+                    !string.IsNullOrEmpty(sel.FilePath) &&
+                    File.Exists(sel.FilePath);
+            }
+
             // 底色切换项：当前模式打勾
             bool white = IsWhiteThumbBackground;
             if (_miThumbWhite != null) _miThumbWhite.Checked = white;
@@ -808,6 +828,105 @@ namespace BlockLibraryManager
             SetStatus("正在把剪贴板中的图块保存到：" + category.FullPath + " …");
         }
 
+        /// <summary>参数面板"插入图形后关闭窗口"勾选变化：写进配置持久化。</summary>
+        private void OnCloseAfterCheckedChanged(object sender, EventArgs e)
+        {
+            if (_config == null || _chkCloseAfter == null) return;
+
+            try
+            {
+                _config.InsertCloseAfter = _chkCloseAfter.Checked;
+                _config.Save();
+            }
+            catch
+            {
+                // 保存失败不影响勾选本身
+            }
+        }
+
+        // ---------------- 重命名块 ----------------
+
+        /// <summary>
+        /// 右键菜单 → 重命名块：把选中的 DWG 文件改成新名字。
+        /// 同步清掉旧路径的缩略图缓存与动态块标记，并替换"最近使用"里的旧路径。
+        /// </summary>
+        private void OnRenameBlockClick(object sender, EventArgs e)
+        {
+            BlockItem sel = GetSingleSelectedBlock();
+            if (sel == null || !sel.IsWholeDrawing || string.IsNullOrEmpty(sel.FilePath)) return;
+
+            string oldPath = sel.FilePath;
+            if (!File.Exists(oldPath))
+            {
+                SetStatus("文件不存在（可能已被移动或删除），无法重命名。");
+                return;
+            }
+
+            IWin32Window owner = FindForm();
+            string oldName = Path.GetFileNameWithoutExtension(oldPath);
+            string newName = RenameBlockForm.Show(owner, "重命名块", "新的块名称：", oldName);
+
+            if (newName == null) return;               // 用户取消
+            newName = newName.Trim();
+            if (newName.Length == 0 || newName.Equals(oldName, StringComparison.OrdinalIgnoreCase)) return;
+
+            // 文件名合法性：过滤系统保留字符
+            foreach (char c in Path.GetInvalidFileNameChars())
+            {
+                if (newName.IndexOf(c) >= 0)
+                {
+                    MessageBox.Show(owner,
+                        "名称中含有不能用在文件名里的字符：" + c,
+                        "重命名块", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+            }
+
+            string newPath = Path.Combine(Path.GetDirectoryName(oldPath), newName + Path.GetExtension(oldPath));
+            if (File.Exists(newPath))
+            {
+                MessageBox.Show(owner,
+                    "同名文件已存在：\n" + newPath,
+                    "重命名块", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                // 先丢弃旧路径的缩略图缓存 / 动态块标记，新名字按新文件重新出图
+                if (_thumbnails != null) _thumbnails.ForgetItem(oldPath);
+
+                File.Move(oldPath, newPath);
+
+                // "最近使用"里记录的旧路径同步替换，避免残留失效条目
+                bool recentChanged = false;
+                if (_config != null && _config.RecentFiles != null)
+                {
+                    for (int i = 0; i < _config.RecentFiles.Count; i++)
+                    {
+                        if (string.Equals(_config.RecentFiles[i], oldPath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _config.RecentFiles[i] = newPath;
+                            recentChanged = true;
+                        }
+                    }
+                    if (recentChanged) _config.Save();
+                }
+
+                SetStatus("已重命名为 " + newName + Path.GetExtension(oldPath) + "，正在刷新列表…");
+                ReloadWithProgress(GetSelectedCategoryPath());
+            }
+            catch (System.Exception ex)
+            {
+                BlmLog.Write("重命名块失败", ex);
+                MessageBox.Show(owner,
+                    "重命名失败：" + ex.Message +
+                    "\n\n文件可能正被 AutoCAD 或其它程序占用，请先关闭该图形后重试。",
+                    "重命名块", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                SetStatus("重命名失败。");
+            }
+        }
+
         // ---------------- 批量入库 ----------------
 
         /// <summary>
@@ -845,9 +964,9 @@ namespace BlockLibraryManager
                 return;
             }
 
-            // 1. 暂存目标目录  2. 面板最小化  3. 命令上下文中执行框选与保存
+            // 1. 暂存目标目录  2. 面板临时让位  3. 命令上下文中执行框选与保存
             BatchBridge.Request(chosen);
-            LibraryPalette.Minimize();
+            LibraryPalette.PushAside();
 
             string message;
             if (!TrySendCommand("BLOCKLIBBATCH", out message))
@@ -858,7 +977,7 @@ namespace BlockLibraryManager
                 return;
             }
 
-            SetStatus("已最小化图库窗口：请在 AutoCAD 中框选要入库的图块，回车结束选择。");
+            SetStatus("已让出图库窗口：请在 AutoCAD 中框选要入库的图块，回车结束选择。");
         }
 
         private void OnTreeAfterSelect(object sender, TreeViewEventArgs e)
@@ -891,8 +1010,15 @@ namespace BlockLibraryManager
             _pcSelectedPath = string.Empty;
 
             CategoryNode category = GetSelectedCategory();
-            _config.LastCategoryPath = category != null ? category.FullPath : string.Empty;
-            _config.Save();
+            string path = category != null ? category.FullPath : string.Empty;
+
+            // 只在真的换了目录时才写盘：以前每次点树节点都整份重写 INI，
+            // 最近使用上百条时等于每次点击都阻塞主线程写一次文件。
+            if (!string.Equals(_config.LastCategoryPath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                _config.LastCategoryPath = path;
+                _config.Save();
+            }
 
             RefreshCurrentView();
         }
@@ -934,6 +1060,54 @@ namespace BlockLibraryManager
 
             InsertOptions options = BuildInsertOptions();
             SendInsertCommand(one, options, true);
+        }
+
+        /// <summary>
+        /// 右键菜单 →"打开该图形文件"：用当前 CAD 打开选中的 DWG，
+        /// 打开成功后自动收起图库管理器窗口（与标题栏 × 同为 Hide，保留浏览状态）。
+        /// </summary>
+        private void OnOpenDrawingClick(object sender, EventArgs e)
+        {
+            BlockItem item = GetSingleSelectedBlock();
+            if (item == null || string.IsNullOrEmpty(item.FilePath) || !File.Exists(item.FilePath))
+            {
+                SetStatus("未找到选中的图形文件。");
+                return;
+            }
+
+            if (!string.Equals(Path.GetExtension(item.FilePath), ".dwg", StringComparison.OrdinalIgnoreCase))
+            {
+                SetStatus("不是 DWG 图形文件：" + Path.GetFileName(item.FilePath));
+                return;
+            }
+
+            try
+            {
+                // DocumentCollection.Open 是同步调用：文件较大时会先完成打开再返回，
+                // 期间 CAD 可能弹"当前图未保存是否保存"等标准提示，属于正常流程。
+                // 以可写方式打开（false = 非只读），方便直接修改后另存回图库。
+                //
+                // 四家 API 形态不一致（已用官方程序集逐一核对）：
+                //   AutoCAD / 中望 / 浩辰 —— Open 是 DocumentCollectionExtension 的扩展方法
+                //   （AutoCAD 与浩辰没有实例 Open，必须走静态扩展类调用）；
+                //   BricsCAD —— 没有扩展类，只有实例方法 docs.Open(...)。
+                Autodesk.AutoCAD.ApplicationServices.DocumentCollection docs =
+                    Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager;
+#if BLM_BRICSCAD
+                docs.Open(item.FilePath, false);
+#else
+                Autodesk.AutoCAD.ApplicationServices.DocumentCollectionExtension.Open(
+                    docs, item.FilePath, false);
+#endif
+
+                // 打开成功 → 关闭图库管理器窗口。用 Hide 而不是销毁，
+                // 再次 BLOCKLIB 唤起时保留上次的目录与设置。
+                try { LibraryPalette.Hide(); } catch { }
+            }
+            catch (System.Exception ex)
+            {
+                SetStatus("打开图形文件失败：" + ex.Message);
+            }
         }
 
         private void OnOpenFolderClick(object sender, EventArgs e)

@@ -1,11 +1,11 @@
 # AutoCAD 图库管理器（Block Library Manager）
 
-一个 AutoCAD .NET 插件：把磁盘上的 DWG 目录变成**可视化图库**——左侧分类树、右侧缩略图墙、底部插入参数，双击或拖拽即可插入当前图形。同时支持中望 CAD、浩辰 CAD。
+一个 AutoCAD .NET 插件：把磁盘上的 DWG 目录变成**可视化图库**——左侧分类树、右侧缩略图墙、底部插入参数，双击或拖拽即可插入当前图形。同时支持中望 CAD、浩辰 CAD、BricsCAD。
 
-**版本覆盖：AutoCAD 2010 ~ 2027**（一套源码，6 个目标框架），外加中望 CAD、浩辰 CAD。
+**当前版本：1.51.5。** 覆盖 AutoCAD 2010 ~ 2027（一套源码，6 个目标框架），外加中望、浩辰、BricsCAD。
 
 **许可证：[MIT](LICENSE)。** 作者：悟空。  
-AutoCAD、中望、浩辰的托管程序集受厂商版权约束，**不包含在本仓库中**。请在装有对应 CAD 的机器上编译。
+AutoCAD、中望、浩辰、BricsCAD 的托管程序集受厂商版权约束，**不包含在本仓库中**。请在装有对应 CAD 的机器上编译，或自行从厂商 NuGet 取得参考程序集后再指定 `CadRefDir`。
 
 ## 构建状态（已实测）
 
@@ -69,7 +69,7 @@ AutoCAD、中望、浩辰的托管程序集受厂商版权约束，**不包含�
 
 - 按住标题栏**拖动**窗口位置；窗口**八边可拉伸**缩放
 - 关闭 AutoCAD 主窗口时窗口跟随最小化（通过 `ShowModelessDialog` 归属主窗口）
-- 位置/尺寸自动记忆到 config.json，下次打开原位还原；显示器变更时自动拉回屏幕内
+- 位置/尺寸自动记忆到 BlockLibrary.ini，下次打开原位还原；显示器变更时自动拉回屏幕内
 - 想改回停靠面板模式，把 `src/UI/LibraryPalette.cs` 换回旧版宿主即可（git 历史）
 
 | 按钮 | 行为 |
@@ -152,7 +152,7 @@ cad-block-manager/
 │   ├── Plugin.cs                    # 插件入口（ExtensionApplication）
 │   ├── Commands.cs                  # 命令 BLOCKLIB / BLOCKLIBH / BLOCKLIBR / BLOCKLIBS / BLOCKLIBIN
 │   ├── Model.cs                     # BlockItem / CategoryNode / GalleryView
-│   ├── Config.cs                    # 配置读写（%APPDATA%\BlockLibraryManager\config.json）
+│   ├── Config.cs                    # 配置读写（DLL 同目录 BlockLibrary.ini）
 │   ├── Helpers\MiniJson.cs          # 零依赖 JSON（net35 没有 System.Text.Json）
 │   ├── Services\
 │   │   ├── LibraryIndex.cs          # 扫描磁盘，构建分类树
@@ -164,6 +164,7 @@ cad-block-manager/
 │       ├── LibraryControl.cs        # 主界面（布局）
 │       ├── LibraryControl.Logic.cs  # 主界面（数据）
 │       ├── LibraryControl.Events.cs # 主界面（事件）
+│       ├── LibraryControl.Draw.cs   # ★ 列表自绘 + 可见区间优先（只为可见项取缩略图）
 │       ├── LibraryPalette.cs        # PaletteSet 宿主
 │       └── SettingsForm.cs          # 设置对话框
 ├── build\                           # 版本工程，每个只有十几行
@@ -173,11 +174,12 @@ cad-block-manager/
 │   ├── CAD2015-2018\   (net45, accore,  AutoCAD 2018)
 │   ├── CAD2019-2024\   (net47, accore,  AutoCAD 2024)
 │   ├── CAD2025-2027\   (net8.0-windows, AutoCAD 2026)
-│   ├── ZWCAD\          (net47,  中望 CAD —— + Common.CadPlatform.props)
-│   └── GstarCAD\       (net48,  浩辰 CAD —— + Common.CadPlatform.props)
+│   ├── ZWCAD\          (net47,          中望 CAD   —— + Common.CadPlatform.props)
+│   ├── GstarCAD\       (net48,          浩辰 CAD   —— + Common.CadPlatform.props)
+│   └── BricsCAD\       (net8.0-windows, BricsCAD   —— + Common.CadPlatform.props)
 ├── tools\
-│   └── gen-platform-src.ps1         # ★ 源码命名空间转换（AutoCAD → 中望 / 浩辰）
-├── bundle\                          # 自动加载插件包（见第 6 节，已含 CAD2019-2024 的 DLL）
+│   └── gen-platform-src.ps1         # ★ 源码命名空间转换（AutoCAD → 中望 / 浩辰 / BricsCAD）
+├── bundle\                          # 自动加载插件包（见第 6 节）
 └── dist\                            # 构建产物（不入库，编译后生成）
 ```
 
@@ -196,28 +198,55 @@ cad-block-manager/
 
 `accoremgd.dll` 从 AutoCAD 2013 起才存在（`ApplicationServices` / `EditorInput` / `Windows` 都搬进去了），2012 及更早只需要 `acdbmgd.dll` + `acmgd.dll`。
 
-### 4.1 国产 CAD 平台对照表
+### 4.1 其它 CAD 平台对照表（中望 / 浩辰 / BricsCAD）
 
-| 目录 | 平台 | 命名空间根 | 托管程序集 | .NET | 条件符号 |
+| 目录 | 平台 | 命名空间 | 托管程序集 | .NET | 条件符号 |
 | --- | --- | --- | --- | --- | --- |
-| `ZWCAD` | 中望 CAD 2020/2021+ | `ZwSoft.ZwCAD.*` | `ZwDatabaseMgd.dll` + `ZwManaged.dll` | net47 | `BLM_ZWCAD` |
-| `GstarCAD` | 浩辰 CAD 2024+ | `Gssoft.Gscad.*` | `GcCoreMgd.dll` + `GcDbMgd.dll` + `GcMgd.dll` | net48 | `BLM_GSTARCAD` |
+| `ZWCAD` | 中望 CAD 2024~2026 | 单根 `ZwSoft.ZwCAD.*` | `ZwDatabaseMgd.dll` + `ZwManaged.dll` | net47 | `BLM_ZWCAD` |
+| `GstarCAD` | 浩辰 CAD 2024/2025 | 单根 `Gssoft.Gscad.*` | `GcCoreMgd.dll` + `GcDbMgd.dll` + `GcMgd.dll` | net48 | `BLM_GSTARCAD` |
+| `BricsCAD` | BricsCAD V26 / V27 | **双根**（见下） | `BrxMgd.dll` + `TD_Mgd.dll` | net8.0-windows | `BLM_BRICSCAD` |
 
-原理：这两家的 .NET API 是 ObjectARX 的整体移植，**类型名与成员签名基本一致，只有命名空间根不同**。
-所以做法不是复制三份源码，而是：
+原理：这三家的 .NET API 都是 ObjectARX 的整体移植，**类型名与成员签名基本一致，只有命名空间不同**。
+所以做法不是复制四份源码，而是：
 
 1. 日常只维护 `src/` 一份源码（写的是 AutoCAD 的命名空间）；
-2. 编译时由 `tools\gen-platform-src.ps1` 自动把 `Autodesk.AutoCAD` 批量替换成目标命名空间，
-   生成到 `build\<平台>\gen\` 里再编译（源码没变就跳过，不拖慢编译）；
-3. 少数这两家不一定实现的成员（`Application.ShowModelessDialog` / `Document.CommandEnded` /
+2. 编译时由 `tools\gen-platform-src.ps1` 自动替换命名空间，生成到 `build\<平台>\gen\` 里
+   再编译（源码没变就跳过，不拖慢编译）；
+3. 少数各家不一定实现的成员（`Application.ShowModelessDialog` / `Document.CommandEnded` /
    `Document.UnknownCommand`），由 `src\Services\CadHost.cs` 用**反射 + IL 适配器**调用：
    有这个成员就走原生路径，没有就自动降级，因此不会在编译期报错。
 
-| 受影响的功能 | AutoCAD | 中望 / 浩辰（有该成员时） | 中望 / 浩辰（无该成员时） |
+#### BricsCAD 的双根命名空间（与中望 / 浩辰最大的区别）
+
+BricsCAD 的托管 API 分装在两个程序集里，命名空间也被拆成**两个根**：
+
+| AutoCAD | BricsCAD | 来自 |
+| --- | --- | --- |
+| `Autodesk.AutoCAD.ApplicationServices` | `Bricscad.ApplicationServices` | `BrxMgd.dll` |
+| `Autodesk.AutoCAD.EditorInput` | `Bricscad.EditorInput` | `BrxMgd.dll` |
+| `Autodesk.AutoCAD.Windows` | `Bricscad.Windows` | `BrxMgd.dll` |
+| `Autodesk.AutoCAD.Runtime` | `Teigha.Runtime` | `TD_Mgd.dll` |
+| `Autodesk.AutoCAD.DatabaseServices` | `Teigha.DatabaseServices` | `TD_Mgd.dll` |
+| `Autodesk.AutoCAD.Geometry` | `Teigha.Geometry` | `TD_Mgd.dll` |
+| `Autodesk.AutoCAD.Colors` | `Teigha.Colors` | `TD_Mgd.dll` |
+
+`Teigha.*` 来自 ODA 的 DWG 内核（`TD_Mgd.dll`），`Bricscad.*` 是 Bricsys 自己在
+`BrxMgd.dll` 里做的 CAD 应用层。映射表写在 `tools\gen-platform-src.ps1` 的
+`$NsMapBricsCAD` 里，没列到的走命名空间根兜底。
+
+> **版本提醒**：BricsCAD **V26 起宿主切换到 .NET 8**，V25 及更早是 .NET Framework 4.8。
+> 本工程默认编 net8.0-windows（对应 V26/V27）；要给 V25 及更早编译，见第 5 节。
+
+| 受影响的功能 | AutoCAD | 其它 CAD（有该成员时） | 其它 CAD（无该成员时） |
 | --- | --- | --- | --- |
 | 面板跟随 CAD 主窗口最小化 | `ShowModelessDialog` | 自动反射调用，效果一致 | 直接 `Form.Show()`，面板不跟着最小化（功能不受影响） |
 | 拖拽插入后自动还原面板 | `CommandEnded` 事件 | 精确时机还原 | 兜底定时器 12 秒还原 |
 | 设置里自定义启动命令 | `UnknownCommand` 事件 | 与 AutoCAD 一致 | 该功能不可用，默认命令 `BLOCKLIB` 照常可用 |
+
+> 已用官方程序集逐个核对过 BricsCAD V27：`Application.ShowModelessDialog(Form)` /
+> `ShowModalDialog(Form)` / `Idle` / `Document.CommandEnded` / `CommandCancelled` /
+> `UnknownCommand` / `UnknownCommandEventArgs.GlobalCommandName` **全部存在**，
+> 所以 BricsCAD 上这三项功能都是完整行为，不会降级。
 
 ---
 
@@ -252,7 +281,7 @@ dotnet build build\CAD2019-2024\BlockLibraryManager.csproj -c Release ^
 每个 csproj 里都写了一个默认值（例如 CAD2019-2024 默认 `C:\Program Files\Autodesk\AutoCAD 2024`），
 路径一致的话可以省略。
 
-### 构建国产 CAD 版本
+### 构建中望 / 浩辰 / BricsCAD 版本
 
 ```bat
 :: 中望 CAD（脚本会先自动探测常见安装路径，也可手工指定）
@@ -261,15 +290,28 @@ build-zwcad.cmd "C:\Program Files\ZWSOFT\ZWCAD 2021"
 :: 浩辰 CAD
 build-gstarcad.cmd "C:\Program Files\Gstarsoft\GstarCAD 2024"
 
-:: 或一次性构建全部 8 个平台（没有装对应 CAD 的会自动跳过）
+:: BricsCAD（官方 API 为 NuGet：BricsCAD.27.NET / BricsCAD.26.NET，本仓库不附带）
+::   把包里的 ref\net8.0 解到 tools\bcapi\v27\ref\net8.0 后可直接：
+build-bricscad.cmd
+build-bricscad.cmd V26
+:: V25 及更早是 .NET Framework 4.8，需指向本机安装目录
+build-bricscad.cmd V25 "C:\Program Files\Bricsys\BricsCAD V25"
+
+:: 或一次性构建全部 9 个平台（没有装对应 CAD、也没有参考程序集的会自动跳过）
 build-all.cmd
 ```
 
-手工打命令的话，两个平台对应的属性是 `CadRefDir`（不是 `AcadRefDir`）：
+手工打命令的话，这几个平台对应的属性是 `CadRefDir`（不是 `AcadRefDir`）：
 
 ```bat
 dotnet build build\ZWCAD\BlockLibraryManager.csproj    -c Release -p:CadRefDir="...中望安装目录"
 dotnet build build\GstarCAD\BlockLibraryManager.csproj -c Release -p:CadRefDir="...浩辰安装目录"
+
+:: BricsCAD：把官方 NuGet 的 ref\net8.0 解到 tools\bcapi\v27\ref\net8.0，或直接指向安装目录
+dotnet build build\BricsCAD\BlockLibraryManager.csproj -c Release ^
+    -p:CadRefDir="tools\bcapi\v27\ref\net8.0"
+dotnet build build\BricsCAD\BlockLibraryManager.csproj -c Release ^
+    -p:TargetFramework=net48 -p:CadRefDir="C:\Program Files\Bricsys\BricsCAD V25"
 ```
 
 个别机器上中望把 `acmgd` 的内容也单列了一个 DLL，追加引用：
@@ -279,9 +321,7 @@ dotnet build build\ZWCAD\BlockLibraryManager.csproj -c Release ^
     -p:CadRefDir="..." -p:ExtraCadRefItems=ZwManagedUx
 ```
 
-> **不要把厂商 DLL 放进仓库。** 中望 `ZwDatabaseMgd.dll` / `ZwManaged.dll`、
-> 浩辰 `GcCoreMgd.dll` / `GcDbMgd.dll` / `GcMgd.dll`，以及 Autodesk 的
-> `acdbmgd.dll` 等都受厂商版权约束，本仓库不附带。
+> **不要把厂商 DLL 放进仓库。** 中望、浩辰、BricsCAD、Autodesk 的托管程序集都受厂商版权约束，本仓库不附带。
 > 找不到这些程序集时，构建会在编译前直接失败，避免生成无法 NETLOAD 的无效 DLL。
 
 ### Visual Studio
@@ -296,7 +336,10 @@ dotnet build build\ZWCAD\BlockLibraryManager.csproj -c Release ^
 ### 产物
 
 ```
-dist\CAD2019-2024\BlockLibraryManager.dll   ← 已实测生成，AutoCAD 2019-2024 可用
+dist\CAD2019-2024\BlockLibraryManager.dll   ← AutoCAD 2019~2024（本机真编译，实测可加载）
+dist\ZWCAD\BlockLibraryManager.dll          ← 中望 CAD（官方 NuGet 程序集真编译）
+dist\GstarCAD\BlockLibraryManager.dll       ← 浩辰 CAD（官方 NuGet 程序集真编译）
+dist\BricsCAD\BlockLibraryManager.dll       ← BricsCAD V26 / V27（官方 NuGet 程序集真编译）
 ```
 
 **每个版本只能用自己那份 DLL**，不要交叉复制。
@@ -311,6 +354,17 @@ dist\CAD2019-2024\BlockLibraryManager.dll   ← 已实测生成，AutoCAD 2019-2
   已成功生成。
       0 个警告
       0 个错误
+
+> dotnet build build\BricsCAD\BlockLibraryManager.csproj -c Release
+
+  gen-platform-src: [BricsCAD] 已生成 30 个文件 -> ...\build\BricsCAD\gen
+  BlockLibraryManager -> ...\dist\BricsCAD\BlockLibraryManager.dll
+  已成功生成。
+      0 个警告
+      0 个错误
+
+  （换用 BricsCAD V26 的参考程序集再编一次：同样 0 警告 0 错误，
+    说明这份 DLL 在 V26 / V27 上通用）
 ```
 
 编译过程中真实暴露并修复的 6 个问题（都是跨版本容易踩的坑）：
@@ -335,7 +389,7 @@ dist\CAD2019-2024\BlockLibraryManager.dll   ← 已实测生成，AutoCAD 2019-2
 
 ### 方式二：自动加载（AutoCAD 2012+ 推荐）
 
-仓库里的 `bundle\BlockLibraryManager.bundle` 已带上 AutoCAD 2019–2024 的 DLL：
+仓库里的 `bundle\BlockLibraryManager.bundle` 带有 AutoCAD 2019–2024 的 DLL：
 
 ```
 BlockLibraryManager.bundle\
@@ -414,10 +468,59 @@ AutoCAD 2010 / 2011 不支持 ApplicationPlugins，请在 `acaddoc.lsp` 里加�
 ### 7.3 缩略图：为什么不用后台线程
 
 AutoCAD 的 `Database` **只能在主线程**操作，丢到 `ThreadPool` 会崩。
-所以采用**队列 + `Application.Idle`** 的模式：每次空闲事件只处理 2 张，
-界面始终可响应；结果先写磁盘 PNG 缓存，第二次打开同一图库基本秒开。
+所以采用**队列 + `Application.Idle`** 的模式：每次空闲事件最多处理 6 张、
+总耗时预算 40ms（到点就收工，剩下的等下一次 Idle），界面始终可响应；
+结果先写磁盘 PNG 缓存，第二次打开同一图库基本秒开。
 
-### 7.4 插入：为什么经过一个命令桥
+### 7.4 缩略图加载：UI 虚拟化 + 解码降采样
+
+> 说明：本插件是 **WinForms**（不是 WPF），所以用户提的 `BitmapImage.DecodePixelWidth`
+> 没有直接对应的 API，这里用的是 GDI+ 的等价做法，效果一致。
+
+**一、UI 虚拟化 —— 只为屏幕上可见的项加载图片**
+
+列表原来走的是 `ListView` + `ImageList`：每加一项就把一整张缩略图塞进 `ImageList`，
+打开一个 2000 个图块的分类就要同步做出 2000 张图，这是刷新列表最慢的一步；
+而且 `ImageList` 没有"原地替换"的方法，缩略图陆续到位时只能 `RemoveByKey` + `Add`，
+一删一加会让后面所有项的索引整体错位。
+
+现在改成 **`OwnerDraw` 自绘**（见 `src\UI\LibraryControl.Draw.cs`）：
+
+| | 原来 | 现在 |
+| --- | --- | --- |
+| ImageList | 每个 item 一张图（几千张） | 只留 1 张透明占位图，纯粹用来撑出图标尺寸 |
+| 取图时机 | 建列表时全部取 | **绘制事件触发时才取**，屏幕外的项永远取不到 |
+| 动态块角标 | 每个动态块复制一张 Bitmap 把角标烤进去 | 绘制期直接叠画上去，零拷贝 |
+| 缩略图到位 | `RemoveByKey`+`Add`+每条 `BeginInvoke`（索引会错位） | 只打脏标记，一帧统一 `Invalidate` 一次 |
+
+WinForms 的 `ListView` 只为可见项发 `DrawItem` / `DrawSubItem` 事件，
+所以"进入一个 2000 项的分类"从"先做 2000 张图"变成"先做屏幕上那几十张"。
+
+**二、数据虚拟化 —— 后台队列跟着视口走**
+
+`ThumbnailService.Prioritize()` 把当前可见区间（用 `LVM_GETTOPINDEX` /
+`LVM_GETCOUNTPERPAGE` 算出）的条目提到队列最前面。用户滚到哪儿，哪一段就优先出图。
+只有可见区间真的变了才重排队列（用指纹比对），不会每帧重排。
+
+**三、解码时降采样**
+
+- **加载磁盘缓存**：GDI+ 没有解码参数，只能在 `Image.FromStream` 之后**立刻**按
+  目标尺寸重采样、然后马上释放大图与流 —— 留在缓存里的是小图而不是原始大图。
+  顺带修掉一个隐患：原来 `Image.FromStream` 依赖的 `MemoryStream` 一直挂着不释放，
+  每张缩略图都额外占着一份完整文件字节。
+- **生成新缩略图**：DWG 内嵌的预览位图动辄 512×512 甚至 1024×768，而后面两步
+  （裁右缘黑带、泛洪换底色）都是**逐像素**处理，是整个生成过程最贵的一段。
+  现在先等比缩到 **2 倍缩略图尺寸**再处理，像素规模降到十几分之一，出图尺寸不变、
+  肉眼无差别。
+
+**四、流畅性**
+
+- 列表打开双缓冲（`DoubleBuffered` 是 `protected`，用反射设），自绘不再闪；
+- `DisplayBlocks` 从逐条 `Items.Add` 改成一次性 `Items.AddRange`，
+  少发几千次原生通知；
+- 每张缩略图到位不再各发一个 `BeginInvoke`，改成脏标记 + 每帧一次 `Invalidate`。
+
+### 7.5 插入：为什么经过一个命令桥
 
 面板是非模态的，在按钮 `Click` 里直接 `Editor.Drag` 经常报 `eNotApplicable`，
 或者鼠标输入被面板吃掉。这里用 Autodesk 官方推荐的模式：
@@ -427,7 +530,7 @@ AutoCAD 的 `Database` **只能在主线程**操作，丢到 `ThreadPool` 会崩
         → 命令 BLOCKLIBIN（命令上下文） → Editor.Drag(jig) → 完成插入
 ```
 
-### 7.5 同名块定义
+### 7.6 同名块定义
 
 块名会先清洗（空格与 `< > / \ " : ; ? * | , = \` '` 转 `_`，最长 250 字符）。
 插入时若目标图中已有同名定义：
@@ -436,7 +539,7 @@ AutoCAD 的 `Database` **只能在主线程**操作，丢到 `ThreadPool` 会崩
   删不掉（说明正被引用）就复用旧定义
 - 不勾选 → 直接复用已有定义
 
-### 7.6 已知局限
+### 7.7 已知局限
 
 - "炸开"是手动实现，**含属性定义（Attribute）的块不会转成属性值**
 - 缩略图用的是 DWG 自带预览图；如果原图保存时没生成预览图，会显示占位图
@@ -449,7 +552,7 @@ AutoCAD 的 `Database` **只能在主线程**操作，丢到 `ThreadPool` 会崩
 
 | 内容 | 路径 |
 | --- | --- |
-| 配置 | `%APPDATA%\BlockLibraryManager\config.json` |
+| 配置 | DLL 同目录 `BlockLibrary.ini`（DLL 目录不可写时回退到 `%APPDATA%\BlockLibraryManager\`） |
 | 缩略图缓存 | `%LOCALAPPDATA%\BlockLibraryManager\Thumbnails\*.png` |
 | 默认图库目录 | `我的文档\AutoCAD BlockLibrary`（首次运行自动创建） |
 
@@ -476,4 +579,4 @@ AutoCAD 的 `Database` **只能在主线程**操作，丢到 `ThreadPool` 会崩
 
 本项目以 [MIT License](LICENSE) 开源。
 
-AutoCAD、中望 CAD、浩辰 CAD 及其托管 API 的名称与程序集分别属于 Autodesk、中望软件、浩辰软件，不在本许可证的授权范围内。
+AutoCAD、中望 CAD、浩辰 CAD、BricsCAD 及其托管 API 的名称与程序集分别属于 Autodesk、中望软件、浩辰软件、Bricsys，不在本许可证的授权范围内。

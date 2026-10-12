@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 缩略图加载策略基准台：把 v1.51（全量排队）和 v1.52（只装视口 + 滚动暂停）
+       放在同一批真实 DWG 上跑，量出首屏就绪时间 / 总耗时 / 工作量差异。
+       刻意编译成 net47：本机有 .NET Framework 引用程序集，且 System.Drawing 内置，
+       不需要联网拉 NuGet 包。 -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net47</TargetFramework>
+    <AssemblyName>ThumbBench</AssemblyName>
+    <RootNamespace>ThumbBench</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 直接把插件里那份预览解析器编进来：同一份代码，测出来的数字才有意义 -->
+    <Compile Include="..\..\src\Services\DwgPreviewReader.cs" Link="DwgPreviewReader.cs" />
+  </ItemGroup>
+
+</Project>

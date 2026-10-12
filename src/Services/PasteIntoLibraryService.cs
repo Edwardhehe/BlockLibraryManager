@@ -27,6 +27,13 @@ namespace BlockLibraryManager
         private static string _pendingDir;
         private static List<ObjectId> _beforeIds;
 
+        /// <summary>清掉一次粘贴入库的中间状态（成功、失败、取消都要走到）。</summary>
+        private static void Reset()
+        {
+            _pendingDir = null;
+            _beforeIds = null;
+        }
+
         /// <summary>
         /// 第一步：记录基准实体并触发 PASTECLIP。
         /// 必须在命令上下文中调用。返回 false 时 message 带错误说明。
@@ -63,7 +70,22 @@ namespace BlockLibraryManager
         public static void CompletePaste()
         {
             Document doc = Application.DocumentManager.MdiActiveDocument;
-            if (doc == null || string.IsNullOrEmpty(_pendingDir)) return;
+
+            // 早退也必须给面板一个回话：否则状态栏会永远停在
+            // "正在把剪贴板中的图块保存到…"，用户以为插件卡死了。
+            if (doc == null)
+            {
+                Reset();
+                LibraryPalette.ReportPaste(false, "没有活动的图形，粘贴入库已取消。");
+                return;
+            }
+
+            if (string.IsNullOrEmpty(_pendingDir))
+            {
+                Reset();
+                LibraryPalette.ReportPaste(false, "粘贴入库超时或已被取消，请重新执行一次。");
+                return;
+            }
 
             string savedPath;
             string message;
@@ -88,6 +110,7 @@ namespace BlockLibraryManager
             savedPath = null;
             string targetDir = _pendingDir;
             List<ObjectId> before = _beforeIds;
+            Reset();
 
             if (string.IsNullOrEmpty(targetDir) || before == null)
             {

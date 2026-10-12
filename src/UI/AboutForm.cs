@@ -18,13 +18,19 @@ namespace BlockLibraryManager
         public const string SubTitle = "Block Library Manager for AutoCAD";
 
         /// <summary>插件版本号。</summary>
-        public const string Version = "1.36.0";
+        public const string Version = "1.51.5";
 
         /// <summary>发布日期。</summary>
-        public const string BuildDate = "2026-10-10";
+        public const string BuildDate = "2026-10-12";
 
         /// <summary>作者 / 开发者。留空则不显示该行。</summary>
         public const string Author = "悟空";
+
+        /// <summary>QQ 号。留空则不显示该行。</summary>
+        public const string QQ = "1972514296";
+
+        /// <summary>QQ 群号。留空则不显示该行。</summary>
+        public const string QQGroup = "617069563";
 
         /// <summary>联系方式（邮箱 / 电话 / 部门）。留空则不显示该行。</summary>
         public const string Contact = "";
@@ -42,8 +48,21 @@ namespace BlockLibraryManager
     /// </summary>
     internal class AboutForm : Form
     {
-        public AboutForm()
+        /// <summary>
+        /// 当前界面主题。
+        /// 以前这里所有颜色都是写死的（白底 + 系统灰字），切到"深黑灰"之后
+        /// 关于窗口仍然是白底黑字，跟面板整体配色完全脱节。现在由调用方
+        /// 把面板当前主题传进来，底色 / 正文 / 灰字 / 按钮全部跟着走。
+        /// null 时回退默认主题，保证任何调用点都不会出现空引用白屏。
+        /// </summary>
+        private readonly UiTheme _theme;
+
+        public AboutForm() : this(null) { }
+
+        /// <param name="theme">面板当前主题；传 null 表示用默认主题（与旧版观感一致）。</param>
+        public AboutForm(UiTheme theme)
         {
+            _theme = theme ?? UiThemes.Default;
             InitializeForm();
         }
 
@@ -54,13 +73,15 @@ namespace BlockLibraryManager
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            BackColor = Color.White;
+            // 内容区底色跟随主题：默认主题 = SystemColors.Window（仍是白底，与旧版一致），
+            // 深黑灰主题 = 石墨黑，清新蓝 / 薄荷绿 / 暖阳橙也各自跟随。
+            BackColor = _theme.ListBack;
             Font = SystemFonts.MessageBoxFont;
             Text = "关于";
 
             const int Width = 480;      // 内容区宽度
             const int Margin = 26;      // 左右留白
-            const int LineHeight = 20;  // 单行文本行高
+            const int LineHeight = 24;  // 单行文本行高（实测行高与它取大者，保证不压字）
             int y = 24;
 
             // 先把所有控件的 y 坐标算出来，最后再定窗口高度
@@ -74,6 +95,7 @@ namespace BlockLibraryManager
             name.Size = new Size(Width - Margin * 2 + 4,
                 TextRenderer.MeasureText(AboutInfo.ProductName, name.Font).Height + 10);
             name.TextAlign = ContentAlignment.MiddleCenter;
+            name.ForeColor = _theme.BodyText;
             Controls.Add(name);
             y += name.Height + 8;
 
@@ -81,7 +103,7 @@ namespace BlockLibraryManager
             {
                 Label sub = new Label();
                 sub.Text = AboutInfo.SubTitle;
-                sub.ForeColor = SystemColors.GrayText;
+                sub.ForeColor = _theme.HintText;
                 sub.AutoSize = true;
                 sub.Location = new Point(Margin, y);
                 Controls.Add(sub);
@@ -94,6 +116,8 @@ namespace BlockLibraryManager
             y = AddLine(Controls, y, Margin, LineHeight, "适用：中望 CAD（ZWCAD）");
 #elif BLM_GSTARCAD
             y = AddLine(Controls, y, Margin, LineHeight, "适用：浩辰 CAD（GstarCAD）");
+#elif BLM_BRICSCAD
+            y = AddLine(Controls, y, Margin, LineHeight, "适用：BricsCAD V26 / V27");
 #else
             y = AddLine(Controls, y, Margin, LineHeight, "适用：AutoCAD 2010 – 2027");
 #endif
@@ -101,6 +125,10 @@ namespace BlockLibraryManager
             if (!string.IsNullOrEmpty(AboutInfo.Author))
                 y = AddLine(Controls, y, Margin, LineHeight, "作者：" + AboutInfo.Author);
             y = AddLine(Controls, y, Margin, LineHeight, "发布日期：" + AboutInfo.BuildDate);
+            if (!string.IsNullOrEmpty(AboutInfo.QQ))
+                y = AddLine(Controls, y, Margin, LineHeight, "QQ：" + AboutInfo.QQ);
+            if (!string.IsNullOrEmpty(AboutInfo.QQGroup))
+                y = AddLine(Controls, y, Margin, LineHeight, "QQ群：" + AboutInfo.QQGroup);
             if (!string.IsNullOrEmpty(AboutInfo.Company))
                 y = AddLine(Controls, y, Margin, LineHeight, "单位：" + AboutInfo.Company);
             if (!string.IsNullOrEmpty(AboutInfo.Contact))
@@ -113,7 +141,7 @@ namespace BlockLibraryManager
                 Label desc = new Label();
                 desc.Text = AboutInfo.Description;
                 desc.Location = new Point(Margin, y);
-                desc.ForeColor = SystemColors.ControlText;
+                desc.ForeColor = _theme.BodyText;
 
                 // 行数 × 行高（行高按字体实测，避免不同 DPI 下截字）
                 int lines = 1;
@@ -133,13 +161,23 @@ namespace BlockLibraryManager
             ok.DialogResult = DialogResult.OK;
             ok.Size = new Size(96, 30);
             ok.Location = new Point(Width - 96 - Margin, height - 30 - 14);
+
+            // 标准按钮的背景是系统色，深色主题下会是一块亮灰"补丁"。
+            // 改成扁平按钮，底色 / 文字 / 描边全部取主题色（默认主题下与系统按钮观感一致）。
+            ok.FlatStyle = FlatStyle.Flat;
+            ok.BackColor = _theme.ChromeBack;
+            ok.ForeColor = _theme.ChromeText;
+            ok.FlatAppearance.BorderColor = _theme.Border;
+            ok.FlatAppearance.BorderSize = 1;
+
             Controls.Add(ok);
             AcceptButton = ok;
             CancelButton = ok;
         }
 
-        /// <summary>加一行文本，返回新的 y。</summary>
-        private static int AddLine(Control.ControlCollection controls, int y, int x, int lineHeight, string text)
+        /// <summary>加一行文本，返回新的 y。行进按实测行高再留 6px 空隙，
+        /// 任何 DPI / 字号下上下行都不会互相压字。</summary>
+        private int AddLine(Control.ControlCollection controls, int y, int x, int lineHeight, string text)
         {
             if (string.IsNullOrEmpty(text)) return y;
 
@@ -147,9 +185,9 @@ namespace BlockLibraryManager
             line.Text = text;
             line.AutoSize = true;
             line.Location = new Point(x, y);
-            line.ForeColor = SystemColors.ControlText;
+            line.ForeColor = _theme.BodyText;
             controls.Add(line);
-            return y + Math.Max(line.Height, lineHeight) + 2;
+            return y + Math.Max(line.Height, lineHeight) + 6;
         }
     }
 }

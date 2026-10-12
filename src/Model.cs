@@ -5,7 +5,7 @@ using System.IO;
 namespace BlockLibraryManager
 {
     /// <summary>
-    /// 右侧图块列表的显示方式。数值即持久化到 config.json 的整数。
+    /// 右侧图块列表的显示方式。数值即持久化到 BlockLibrary.ini 的整数。
     /// </summary>
     public enum GalleryView
     {

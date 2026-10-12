@@ -325,7 +325,10 @@ namespace BlockLibraryManager
                 }
             }
 
-            string key = directory;
+            // 键统一走 Normalize（去尾部分隔符 + 转小写）：手工改过的根路径
+            // 可能带尾部 "\" 或大小写不一致，直接拿原始串当键会和查询时对不上，
+            // 表现为"这个分类显示 0 个图块"，而总数却是非零。
+            string key = Normalize(directory);
             if (!_byDirectory.ContainsKey(key))
                 _byDirectory.Add(key, items);
             else
@@ -361,7 +364,12 @@ namespace BlockLibraryManager
                     continue;
                 }
 
-                if (IsIgnoredDirectory(subInfo)) continue;
+                // 拒绝访问 / 重解析点上读 Attributes 会抛异常，不能让它冒出去中断整个刷新
+                bool ignored;
+                try { ignored = IsIgnoredDirectory(subInfo); }
+                catch { continue; }
+                if (ignored) continue;
+
                 if (IsExcluded(subInfo.FullName)) continue;   // 用户隐藏的子目录：不建节点、不扫描
 
                 CategoryNode child = new CategoryNode();
@@ -431,7 +439,7 @@ namespace BlockLibraryManager
             if (node == null || string.IsNullOrEmpty(node.FullPath)) return result;
 
             List<BlockItem> found;
-            if (_byDirectory.TryGetValue(node.FullPath, out found))
+            if (_byDirectory.TryGetValue(Normalize(node.FullPath), out found))
                 result.AddRange(found);
 
             SortBlockItems(result);
@@ -447,7 +455,7 @@ namespace BlockLibraryManager
             if (!string.IsNullOrEmpty(node.FullPath))
             {
                 List<BlockItem> found;
-                if (_byDirectory.TryGetValue(node.FullPath, out found))
+                if (_byDirectory.TryGetValue(Normalize(node.FullPath), out found))
                     result.AddRange(found);
             }
 
@@ -458,26 +466,83 @@ namespace BlockLibraryManager
             return result;
         }
 
-        /// <summary>按名字关键字过滤。</summary>
+        /// <summary>
+        /// 按名字关键字过滤（v1.49.1 优化）。
+        /// 调用方传 _index.AllBlocks 即在用户加入图库的所有根目录、所有子目录里搜：
+        /// 1. 关键词允许带 .dwg / .dwt 扩展名（输入"门.dwg"与"门"等效）；
+        /// 2. 同时匹配显示名、磁盘文件名（含/不含扩展名）与 DWG 内部块名；
+        /// 3. 支持空格分隔多个关键字，全部命中才显示（AND）。
+        /// 命中的条目显示在右侧缩略图区域。
+        /// </summary>
         public static List<BlockItem> FilterByName(List<BlockItem> source, string keyword)
         {
             List<BlockItem> result = new List<BlockItem>();
             if (source == null) return result;
 
-            if (string.IsNullOrEmpty(keyword))
+            keyword = keyword == null ? string.Empty : keyword.Trim();
+            if (keyword.Length == 0)
             {
                 result.AddRange(source);
                 return result;
             }
 
-            string key = keyword.Trim();
+            // 空格分隔多关键字；每个关键字都去掉图纸扩展名再比
+            string[] keys = keyword.Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            string[] normalized = new string[keys.Length];
+            for (int i = 0; i < keys.Length; i++)
+                normalized[i] = TrimDwgExtension(keys[i]);
+
             foreach (BlockItem item in source)
             {
-                if (item.Name != null && item.Name.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0)
-                    result.Add(item);
+                if (item == null) continue;
+                if (MatchesAllKeywords(item, normalized)) result.Add(item);
             }
+
             SortBlockItems(result);
             return result;
+        }
+
+        /// <summary>关键词末尾的 .dwg / .dwt / .dws 后缀不算搜索内容的一部分。</summary>
+        private static string TrimDwgExtension(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return key;
+
+            string[] exts = new string[] { ".dwg", ".dwt", ".dws" };
+            foreach (string ext in exts)
+            {
+                if (key.Length > ext.Length &&
+                    key.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
+                {
+                    return key.Substring(0, key.Length - ext.Length);
+                }
+            }
+            return key;
+        }
+
+        /// <summary>所有关键字都命中（显示名 / 文件名 / 内部块名任一字段包含即可）才算匹配。</summary>
+        private static bool MatchesAllKeywords(BlockItem item, string[] keys)
+        {
+            string name = item.Name ?? string.Empty;
+            string fileName = string.IsNullOrEmpty(item.FilePath)
+                ? string.Empty
+                : Path.GetFileName(item.FilePath);
+            string fileNameNoExt = string.IsNullOrEmpty(item.FilePath)
+                ? string.Empty
+                : Path.GetFileNameWithoutExtension(item.FilePath);
+            string blockName = item.BlockName ?? string.Empty;
+
+            foreach (string key in keys)
+            {
+                bool hit =
+                    (key.Length == 0) ||
+                    name.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    fileNameNoExt.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    fileName.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    blockName.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0;
+
+                if (!hit) return false;   // AND：任一关键字没命中就整条排除
+            }
+            return true;
         }
 
         public CategoryNode FindNodeByPath(string fullPath)

@@ -3,11 +3,16 @@ setlocal
 
 REM ============================================================
 REM  一次性构建全部平台：
-REM    AutoCAD 6 个版本组 + 中望 CAD + 浩辰 CAD
+REM    AutoCAD 6 个版本组 + 中望 CAD + 浩辰 CAD + BricsCAD
 REM
 REM  脚本按顺序探测常见安装目录：找到就构建，找不到就跳过。
 REM  装在别的盘的，直接改下面的 ZWCAD / GSTARCAD 变量，
-REM  或者直接运行 build-zwcad.cmd / build-gstarcad.cmd 指定路径。
+REM  或者直接运行 build-zwcad.cmd / build-gstarcad.cmd / build-bricscad.cmd
+REM  指定路径。
+REM
+REM  注意：BricsCAD 的官方 .NET API 以 NuGet 包公开发布（BricsCAD.27.NET）。
+REM  本仓库不附带这些程序集。把 ref\net8.0 解到 tools\bcapi\v27\ref\net8.0，
+REM  或改成下面这一行指向本机 BricsCAD 安装目录。
 REM ============================================================
 
 set "PF=C:\Program Files\Autodesk"
@@ -29,6 +34,7 @@ call :BuildAcad CAD2019-2024 "%ACAD2024%"
 call :BuildAcad CAD2025-2027 "%ACAD2026%"
 call :BuildZw   ZWCAD        "%ZWCAD%"
 call :BuildGc   GstarCAD     "%GSTARCAD%"
+call :BuildBc   BricsCAD     "%~dp0tools\bcapi\v27\ref\net8.0"
 
 echo.
 echo 全部构建流程结束。产物在 dist\ 下按平台分目录存放。
@@ -75,6 +81,21 @@ if not exist "%D%\GcDbMgd.dll" (
 )
 echo.
 echo ============ 正在构建 浩辰 CAD (GstarCAD) ============
+dotnet build "%~dp0build\%V%\BlockLibraryManager.csproj" -c Release -p:CadRefDir="%D%"
+if errorlevel 1 (echo [失败] %V%) else (echo [成功] %V% -^> dist\%V%)
+exit /b 0
+
+:BuildBc
+set "V=%~1"
+set "D=%~2"
+if not exist "%D%\BrxMgd.dll" (
+    echo.
+    echo [跳过] BricsCAD —— 未找到 BrxMgd.dll（%D%）
+    echo         可运行：build-bricscad.cmd 自动探测安装目录
+    exit /b 0
+)
+echo.
+echo ============ 正在构建 BricsCAD ============
 dotnet build "%~dp0build\%V%\BlockLibraryManager.csproj" -c Release -p:CadRefDir="%D%"
 if errorlevel 1 (echo [失败] %V%) else (echo [成功] %V% -^> dist\%V%)
 exit /b 0

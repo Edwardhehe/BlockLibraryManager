@@ -6,7 +6,7 @@ namespace BlockLibraryManager
     /// <summary>
     /// 界面语言服务。
     /// 默认跟随系统语言（zh 开头用中文，其余用英文）；
-    /// 用户可在"语言"对话框里固定为简体中文或 English，选择持久化到 config.json。
+    /// 用户可在"语言"对话框里固定为简体中文或 English，选择持久化到 BlockLibrary.ini。
     /// 用法：L.T("中文文案", "English text")。
     /// </summary>
     public static class LanguageService
