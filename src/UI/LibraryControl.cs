@@ -87,6 +87,15 @@ namespace BlockLibraryManager
         /// <summary>是否已经成功设置过 SplitterDistance（成功一次后就不再干预）。</summary>
         private bool _splitterApplied;
 
+        /// <summary>
+        /// 用户正在手动拖动分割条（SplitterMoving 置位，SplitterMoved 消费后清零）。
+        /// 只在拖动结束时才把位置写进配置：窗口尺寸变化、程序化布局都会被动地
+        /// 改变 SplitterDistance 并同样触发 SplitterMoved，不区分的话，
+        /// 这些被动值会把用户调好的位置冲掉（表现为"记忆功能失效"）。
+        /// </summary>
+        private bool _userDraggingSplit;
+        private bool _userDraggingLeftSplit;
+
         private Panel _bottomPanel;
         private Label _lblScale;
         private TextBox _txtScaleX;
@@ -777,6 +786,15 @@ namespace BlockLibraryManager
                     {
                         if (ReferenceEquals(c, _paramHeaderPanel)) continue;
 
+                        // 数字输入框与勾选框固定白底，不跟主题走：
+                        // CheckBox 勾选方块的内部填充用的就是 BackColor，
+                        // 染成主题色后方块里是一块主题色（用户明确要求白色）。
+                        if (c is TextBox || c is CheckBox)
+                        {
+                            c.BackColor = Color.White;
+                            continue;
+                        }
+
                         c.BackColor = t.PanelBack;
 
                         Label lbl = c as Label;
@@ -992,6 +1010,8 @@ namespace BlockLibraryManager
             _split.Resize += new EventHandler(OnSplitResize);
             // 宽度记忆：用户拖动分割条后保存，下次启动按上次的宽度恢复
             _split.SplitterMoved += new SplitterEventHandler(OnSplitterMoved);
+            // 只有"用户亲手拖动"才允许写配置（见 _userDraggingSplit 说明）
+            _split.SplitterMoving += new SplitterCancelEventHandler(OnSplitterMoving);
 
             // 左侧分类树
             _tree = new TreeView();
@@ -1033,6 +1053,8 @@ namespace BlockLibraryManager
             _leftSplit.Resize += new EventHandler(OnLeftSplitResize);
             // 高度记忆：用户拖动上下分割条后保存，下次启动按上次位置恢复
             _leftSplit.SplitterMoved += new SplitterEventHandler(OnLeftSplitterMoved);
+            // 只有"用户亲手拖动"才允许写配置（见 _userDraggingLeftSplit 说明）
+            _leftSplit.SplitterMoving += new SplitterCancelEventHandler(OnLeftSplitterMoving);
 
             // 标题栏要贴顶：Dock 布局按加入顺序反向排布，
             // Fill 的树先进，Top 的标题栏后进（最后加 = 最上方），树自动填充剩余高度。
@@ -1357,6 +1379,7 @@ namespace BlockLibraryManager
             _paramPanel.Controls.Add(lblScalePrefix);   // 先挂上，布局时再定位
 
             _txtScaleX = new TextBox();
+            _txtScaleX.BackColor = Color.White;
             _txtScaleX.Width = 44;
             _txtScaleX.Text = "1";
             _txtScaleX.BorderStyle = BorderStyle.FixedSingle;
@@ -1367,7 +1390,12 @@ namespace BlockLibraryManager
             _chkLayerZero.Text = string.Empty;
             _chkLayerZero.AutoSize = false;
             _chkLayerZero.Size = new Size(20, 18);
-            _chkLayerZero.BackColor = SystemColors.Control;
+            _chkLayerZero.BackColor = Color.White;
+            // 视觉样式下 CheckBox 方块内部由系统渲染器绘制，不理会 BackColor；
+            // 只有 FlatStyle.Flat 才用 BackColor 填充方块内部（白底），
+            // 边框用 FlatAppearance.BorderColor 描一圈浅灰保持可见。
+            _chkLayerZero.FlatStyle = FlatStyle.Flat;
+            _chkLayerZero.FlatAppearance.BorderColor = Color.FromArgb(160, 160, 160);
             _chkLayerZero.TabStop = false;
 
             _lblLayerName = new Label();
@@ -1387,7 +1415,9 @@ namespace BlockLibraryManager
             _chkColorByLayer.Text = string.Empty;
             _chkColorByLayer.AutoSize = false;
             _chkColorByLayer.Size = new Size(20, 18);
-            _chkColorByLayer.BackColor = SystemColors.Control;
+            _chkColorByLayer.BackColor = Color.White;
+            _chkColorByLayer.FlatStyle = FlatStyle.Flat;
+            _chkColorByLayer.FlatAppearance.BorderColor = Color.FromArgb(160, 160, 160);
             _chkColorByLayer.TabStop = false;
 
             _lblColorName = new Label();
@@ -1407,7 +1437,9 @@ namespace BlockLibraryManager
             _chkExplode.Text = string.Empty;
             _chkExplode.AutoSize = false;
             _chkExplode.Size = new Size(20, 18);
-            _chkExplode.BackColor = SystemColors.Control;
+            _chkExplode.BackColor = Color.White;
+            _chkExplode.FlatStyle = FlatStyle.Flat;
+            _chkExplode.FlatAppearance.BorderColor = Color.FromArgb(160, 160, 160);
             _chkExplode.TabStop = false;
 
             _lblExplodeName = new Label();
@@ -1428,7 +1460,9 @@ namespace BlockLibraryManager
             _chkCloseAfter.Text = string.Empty;
             _chkCloseAfter.AutoSize = false;
             _chkCloseAfter.Size = new Size(20, 18);
-            _chkCloseAfter.BackColor = SystemColors.Control;
+            _chkCloseAfter.BackColor = Color.White;
+            _chkCloseAfter.FlatStyle = FlatStyle.Flat;
+            _chkCloseAfter.FlatAppearance.BorderColor = Color.FromArgb(160, 160, 160);
             _chkCloseAfter.TabStop = false;
             _chkCloseAfter.CheckedChanged += new EventHandler(OnCloseAfterCheckedChanged);
 
@@ -1573,6 +1607,9 @@ namespace BlockLibraryManager
         private void ApplyLeftSplitDistance()
         {
             if (_leftSplitApplied || _leftSplit == null) return;
+            // 同 ApplySplitterDistance：等 Initialize(config) 读入记忆值后再首次应用，
+            // 否则构造期布局会用"默认平分"消费掉 _leftSplitApplied，高度记忆失效。
+            if (_config == null) return;
             if (_leftSplit.Height <= 0 || _leftSplit.Width <= 0) return;
 
             try
@@ -1610,12 +1647,17 @@ namespace BlockLibraryManager
         /// <summary>
         /// 用户拖动左侧上下分割条后把位置写进配置，下次启动按上次的分割位置恢复。
         /// 程序化初始设置（_leftSplitApplied 尚为 false）不落盘；
-        /// 值没变化时不写盘，避免拖动窗口大小时频繁写配置。
+        /// 窗口高度被动变化引起的 SplitterMoved 也不落盘——左分割容器
+        /// FixedPanel 是 Panel2，面板高度一变 SplitterDistance 就被系统重算，
+        /// 不加"用户拖动"判定的话，这些被动值会把用户调好的高度冲掉
+        /// （这正是"高度记忆失效"的原因）。值没变化时不写盘。
         /// </summary>
         private void OnLeftSplitterMoved(object sender, SplitterEventArgs e)
         {
             if (_config == null || _leftSplit == null) return;
             if (!_leftSplitApplied) return;
+            if (!_userDraggingLeftSplit) return;
+            _userDraggingLeftSplit = false;
 
             try
             {
@@ -1910,13 +1952,27 @@ namespace BlockLibraryManager
             ApplySplitterDistance();
         }
 
+        private void OnSplitterMoving(object sender, SplitterCancelEventArgs e)
+        {
+            _userDraggingSplit = true;
+        }
+
+        private void OnLeftSplitterMoving(object sender, SplitterCancelEventArgs e)
+        {
+            _userDraggingLeftSplit = true;
+        }
+
         /// <summary>
         /// 用户拖动分割条（或程序设置 SplitterDistance）后把宽度写进配置，
         /// 下次启动按这个宽度恢复。值没变化时不写盘，避免拖动窗口时频繁落盘。
+        /// 只有用户亲手拖动（SplitterMoving 置位）才记——窗口尺寸被动变化
+        /// 触发的 SplitterMoved 不记，否则会把用户调好的宽度冲掉。
         /// </summary>
         private void OnSplitterMoved(object sender, SplitterEventArgs e)
         {
             if (_config == null || _split == null) return;
+            if (!_userDraggingSplit) return;
+            _userDraggingSplit = false;
 
             try
             {
@@ -1944,6 +2000,12 @@ namespace BlockLibraryManager
         private void ApplySplitterDistance()
         {
             if (_splitterApplied || _split == null) return;
+            // 必须等 Initialize(config) 把上次记忆的宽度读进来后再"首次应用"。
+            // 否则窗体构造函数里的默认尺寸（440×680）触发布局时就会用默认
+            // 180 消费掉 _splitterApplied，之后 Initialize 读到的记忆值永远
+            // 没机会生效——这正是"宽度记忆恢复失效"的根因（保存一直是好的，
+            // INI 里 TreePanelWidth 每次都写对了，只是启动时读了个寂寞）。
+            if (_config == null) return;
             if (_split.Width <= 0 || _split.Height <= 0) return;
 
             const int wantPanel1Min = 100;

@@ -24,7 +24,7 @@
     <AssemblyName>BlockLibraryManager</AssemblyName>
     <ProductName>图库管理器</ProductName>
     <Company>BlockLibraryManager</Company>
-    <Version>1.51.5</Version>
+    <Version>1.51.7</Version>
     <LangVersion>7.3</LangVersion>
     <!-- 强制按 UTF-8 读取源码，保证中文字符串不乱码 -->
     <CodePage>65001</CodePage>
