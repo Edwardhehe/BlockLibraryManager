@@ -125,8 +125,12 @@ namespace BlockLibraryManager
 
         private void OnTreeMenuOpening(object sender, System.ComponentModel.CancelEventArgs e)
         {
-            if (_menuTargetNode == null && _tree != null)
-                _menuTargetNode = _tree.SelectedNode;
+            // v1.51.12：无条件重取目标节点。
+            // 以前是"为空才补"，而有些处理器（打开文件夹位置 / 刷新缩略图）用完
+            // 不清空它。右键节点 A 后按 Esc 关掉菜单，再在空白处右键时
+            // _menuTargetNode 还是 A —— 菜单内容与实际指向的对象不符。
+            _menuTargetNode = null;
+            if (_tree != null) _menuTargetNode = _tree.SelectedNode;
 
             TreeNode target = _menuTargetNode;
 
@@ -148,10 +152,13 @@ namespace BlockLibraryManager
                 _miTreeOpenFolder.Visible = true;
                 _miTreeOpenFolder.Enabled = exists;
                 _miTreeAddLib.Enabled = exists;
+                _miTreeRefresh.Visible = true;
+                _miTreeRefresh.Enabled = exists;
                 return;
             }
 
             _miTreeAddLib.Visible = false;
+            _miTreeRefresh.Visible = false;
 
             // ---- 收藏节点：只允许"从收藏夹移除"和"打开文件夹位置" ----
             FavoriteTag fav = target != null ? target.Tag as FavoriteTag : null;
@@ -168,6 +175,8 @@ namespace BlockLibraryManager
                 _miTreeOpenFolder.Visible = true;
                 _miTreeOpenFolder.Enabled = Directory.Exists(fav.Path);
                 _miTreeRemove.Visible = false;
+                _miTreeRefresh.Visible = true;
+                _miTreeRefresh.Enabled = _miTreeOpenFolder.Enabled;
                 return;
             }
 
@@ -199,6 +208,8 @@ namespace BlockLibraryManager
 
             _miTreeOpenFolder.Visible = true;
             _miTreeOpenFolder.Enabled = !category.Missing;
+            _miTreeRefresh.Visible = true;
+            _miTreeRefresh.Enabled = !category.Missing;
         }
 
         /// <summary>目录树展开前："此电脑"分支的目录此时才真正枚举子目录。</summary>
@@ -325,6 +336,91 @@ namespace BlockLibraryManager
             }
         }
 
+        /// <summary>
+        /// 右键菜单取目标路径的三段式解析（与 OnTreeOpenFolderClick 一致）：
+        /// 收藏节点 → 此电脑节点 → 普通图库目录。
+        /// </summary>
+        private static string ResolveTreeMenuPath(TreeNode node)
+        {
+            FavoriteTag fav = node != null ? node.Tag as FavoriteTag : null;
+            if (fav != null && !string.IsNullOrEmpty(fav.Path)) return fav.Path;
+
+            PcTag pc = node != null ? node.Tag as PcTag : null;
+            if (pc != null && !string.IsNullOrEmpty(pc.Path)) return pc.Path;
+
+            CategoryNode category = node != null ? node.Tag as CategoryNode : null;
+            if (category != null) return category.FullPath;
+
+            return null;
+        }
+
+        /// <summary>
+        /// 目录树右键菜单 → 刷新缩略图：只清用户所选文件夹（含子目录）的
+        /// 缩略图缓存并重新生成，其它文件夹一概不动。
+        /// </summary>
+        private void OnTreeRefreshClick(object sender, EventArgs e)
+        {
+            if (_thumbnails == null) return;
+
+            if (_menuTargetNode == null && _tree != null)
+                _menuTargetNode = _tree.SelectedNode;
+
+            string path = ResolveTreeMenuPath(_menuTargetNode);
+            if (string.IsNullOrEmpty(path)) return;
+
+            if (!Directory.Exists(path))
+            {
+                SetStatus("文件夹不存在（可能已被移动或删除）。");
+                return;
+            }
+
+            // 目录树节点显示的可能是重命名前的旧名字，统一切到磁盘真实路径
+            try { path = Path.GetFullPath(path); } catch { }
+
+            int count = _thumbnails.InvalidateFolder(path);
+
+            // 当前视图如果正是该文件夹（或其子目录）的内容，立刻重载列表——
+            // 缓存已清空，重建条目时会自动重新排队出图；其它文件夹不动。
+            string current = GetCurrentBrowsePath();
+            bool affectsCurrent = false;
+            if (!string.IsNullOrEmpty(current))
+            {
+                string pathTrim = path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string curTrim = current.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+                // v1.51.12 修：漏判了"刷新的就是当前目录本身"这一种情况。
+                // 原来只有 StartsWith(path + 分隔符) 两个分支，而 current == path 时
+                // "D:\Blocks".StartsWith("D:\Blocks\") 恒为 false
+                // → 缓存清空了但列表没重载 → 画面上是旧图/占位图，点"刷新"像没生效。
+                // GetCurrentBrowsePath() 返回的正是 category.FullPath 或 _pcSelectedPath，
+                // 与树节点路径完全相等，所以"在正在看的目录上右键刷新"必踩这条。
+                affectsCurrent = string.Equals(curTrim, pathTrim, StringComparison.OrdinalIgnoreCase)
+                    || curTrim.StartsWith(pathTrim + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                    || curTrim.StartsWith(pathTrim + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (affectsCurrent) RefreshCurrentView();
+
+            SetStatus(count > 0
+                ? string.Format("已刷新该文件夹 {0} 个图形的缩略图。", count)
+                : "该文件夹下没有 DWG 文件。");
+        }
+
+        /// <summary>当前列表正在浏览的磁盘目录（此电脑 / 收藏 / 图库分类三类节点）。</summary>
+        private string GetCurrentBrowsePath()
+        {
+            if (!string.IsNullOrEmpty(_pcSelectedPath)) return _pcSelectedPath;
+
+            if (_tree != null && _tree.SelectedNode != null)
+            {
+                FavoriteTag fav = _tree.SelectedNode.Tag as FavoriteTag;
+                if (fav != null && !string.IsNullOrEmpty(fav.Path)) return fav.Path;
+            }
+
+            CategoryNode category = GetSelectedCategory();
+            return category != null ? category.FullPath : null;
+        }
+
         private void OnTreeRemoveClick(object sender, EventArgs e)
         {
             if (_config == null) return;
@@ -372,18 +468,13 @@ namespace BlockLibraryManager
             }
 
             _menuTargetNode = null;
-            ReloadWithProgress(null);
 
-            if (_tree != null && _tree.Nodes.Count > 0)
-            {
-                try
-                {
-                    _tree.Nodes[0].Expand();
-                    _tree.SelectedNode = _tree.Nodes[0];
-                }
-                catch { }
-                RefreshCurrentView();
-            }
+            // v1.51.12：ReloadWithProgress 内部已经走 RebuildAfterScan ——
+            // 重建整棵树 + 选中恢复（LastCategoryPath 上面已清空，会自然落到
+            // Nodes[0]，选中事件本身就会触发 RefreshCurrentView）+ 再刷一次视图。
+            // 下面这几行是第三遍：又一次全量 DisplayBlocks（重建 N 个
+            // ListViewItem + 重新排队所有缩略图）。删掉。
+            ReloadWithProgress(null);
 
             SetStatus(removed > 0
                 ? "已从图库列表中移除：" + target + "（磁盘文件未删除）"
@@ -424,18 +515,10 @@ namespace BlockLibraryManager
             }
 
             _menuTargetNode = null;
-            ReloadWithProgress(null);
 
-            if (_tree != null && _tree.Nodes.Count > 0)
-            {
-                try
-                {
-                    _tree.Nodes[0].Expand();
-                    _tree.SelectedNode = _tree.Nodes[0];
-                }
-                catch { }
-                RefreshCurrentView();
-            }
+            // 同上（见 OnTreeRemoveClick）：RebuildAfterScan 里已有等价逻辑，
+            // 这里别再对着同一份数据重建第三遍列表。
+            ReloadWithProgress(null);
 
             SetStatus("已隐藏子目录：" + path + "（根目录保留；可在“设置”里恢复显示）");
         }
@@ -1037,6 +1120,11 @@ namespace BlockLibraryManager
 
         private void OnListDoubleClick(object sender, EventArgs e)
         {
+            // 双击落在可见性 ◀ ▶ 按钮上 = 用户在快速切换状态，不是要插入，
+            // 直接吞掉（否则切换可见性会把图块插进当前图形，v1.51.9 用户反馈）
+            if (_list != null && IsVisibilityButtonHit(_list.PointToClient(Cursor.Position)))
+                return;
+
             DoInsert(GetSelectedBlocks());
         }
 
@@ -1081,32 +1169,37 @@ namespace BlockLibraryManager
                 return;
             }
 
-            try
-            {
-                // DocumentCollection.Open 是同步调用：文件较大时会先完成打开再返回，
-                // 期间 CAD 可能弹"当前图未保存是否保存"等标准提示，属于正常流程。
-                // 以可写方式打开（false = 非只读），方便直接修改后另存回图库。
-                //
-                // 四家 API 形态不一致（已用官方程序集逐一核对）：
-                //   AutoCAD / 中望 / 浩辰 —— Open 是 DocumentCollectionExtension 的扩展方法
-                //   （AutoCAD 与浩辰没有实例 Open，必须走静态扩展类调用）；
-                //   BricsCAD —— 没有扩展类，只有实例方法 docs.Open(...)。
-                Autodesk.AutoCAD.ApplicationServices.DocumentCollection docs =
-                    Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager;
-#if BLM_BRICSCAD
-                docs.Open(item.FilePath, false);
-#else
-                Autodesk.AutoCAD.ApplicationServices.DocumentCollectionExtension.Open(
-                    docs, item.FilePath, false);
-#endif
+            // 打开逻辑统一交给 DocumentOpener：它会依次尝试
+            // ① 静态扩展 Open ② 实例 Open ③ AppContextOpenDocument ④ COM，
+            // 并校验"文档数是否真的增加了"——中望 2026 上出现过调用成功返回
+            // 却什么都没打开的情况（原实现只看有没有抛异常，所以点了没反应）。
+            string message;
+            bool ok = DocumentOpener.TryOpen(item.FilePath, out message);
 
+            if (ok)
+            {
                 // 打开成功 → 关闭图库管理器窗口。用 Hide 而不是销毁，
                 // 再次 BLOCKLIB 唤起时保留上次的目录与设置。
                 try { LibraryPalette.Hide(); } catch { }
+                SetStatus("已打开图形文件：" + System.IO.Path.GetFileName(item.FilePath));
+                return;
             }
-            catch (System.Exception ex)
+
+            SetStatus("打开图形文件失败：" + message);
+
+            // 四条通道都打不开时弹窗说明（原来只在状态栏显示一行，容易被忽略），
+            // 并把详细原因写进日志，便于回传排查。
+            try
             {
-                SetStatus("打开图形文件失败：" + ex.Message);
+                MessageBox.Show(
+                    "无法用 CAD 打开该图形文件：\n" + item.FilePath +
+                    "\n\n原因：" + message +
+                    "\n\n详细信息已写入：" + BlmLog.LogFilePath,
+                    "图库管理器", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            catch
+            {
+                // 弹窗失败不影响状态栏提示
             }
         }
 
@@ -1186,8 +1279,18 @@ namespace BlockLibraryManager
                 // 拖出到外部失败不影响其他功能
             }
 
-            try { LibraryPalette.EndDragInsert(dropped); } catch { }
+            try { LibraryPalette.EndDragInsert(dropped && !_dragDroppedInside); } catch { }
+            _dragDroppedInside = false;
         }
+
+        /// <summary>
+        /// 本次拖拽是不是**落在图库面板自己身上**（列表/目录树）。
+        /// v1.51.12：以前只看 DoDragDrop 的返回值判断"有没有放成功"，
+        /// 但列表自己也是合法放置目标（AllowDrop=true），于是把缩略图拖回面板
+        /// （或拖到任何接受 FileDrop 的地方）也被当成"已经插进 CAD 了" →
+        /// 面板最小化 25 秒等那个根本不会来的 CAD 命令，INSUNITS 也被扣 25 秒。
+        /// </summary>
+        private bool _dragDroppedInside;
 
         private void OnListDragEnter(object sender, DragEventArgs e)
         {
@@ -1200,6 +1303,9 @@ namespace BlockLibraryManager
 
         private void OnListDragDrop(object sender, DragEventArgs e)
         {
+            // 拖回面板自己：告诉 OnListItemDrag 别把它当成"已插入 CAD"
+            _dragDroppedInside = true;
+
             string folder = ResolveTargetFolderForDrop();
             if (string.IsNullOrEmpty(folder))
             {
@@ -1276,6 +1382,7 @@ namespace BlockLibraryManager
         private bool IsLibraryFile(string path)
         {
             if (string.IsNullOrEmpty(path)) return false;
+            if (_config == null || _config.FileFilters == null) return false;   // v1.51.12：同类判空
 
             string name = Path.GetFileName(path);
             foreach (string filter in _config.FileFilters)

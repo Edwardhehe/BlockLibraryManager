@@ -34,11 +34,24 @@ namespace BlockLibraryManager
                 // 中望 / 浩辰：把自己登记进"随 CAD 启动自动加载"的 HKCU 注册表。
                 // 用户手动加载一次后，以后重启 CAD 不再需要 netload / APPLOAD。
                 // AutoCAD / BricsCAD 上是空方法（前者走 bundle 自动加载）。
-                AutoLoadRegister.EnsureRegistered();
+                //
+                // v1.51.12：丢到线程池做。
+                // EnsureRegistered 内部是"产品 × 版本 × 语言"三层嵌套枚举 + 每个组合
+                // 一次可写 OpenSubKey / CreateSubKey + 最多 8 次读写。装过几个版本、
+                // 几个语言包时就是上百次注册表事务，而 HKCU 在漫游 / 网络 profile 上
+                // 一次访问可达数十毫秒 —— Initialize 是 AutoCAD **同步**调用的启动钩子，
+                // 在这里做完整句话等同于"CAD 启动雪崩一段"。
+                // 登记结果只影响"下一次启动"，晚几百毫秒毫无副作用。
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate (object state)
+                {
+                    try { AutoLoadRegister.EnsureRegistered(); }
+                    catch { }
+                });
             }
             catch
             {
-                // 登记失败只影响"下次自动加载"，不影响本次使用
+                // 连线程池都排不上（极端情况）就直接同步来一次，保证功能不丢
+                try { AutoLoadRegister.EnsureRegistered(); } catch { }
             }
 
             try
@@ -57,6 +70,19 @@ namespace BlockLibraryManager
 
         public void Terminate()
         {
+            try
+            {
+                // v1.51.12：把挂在 DocumentCollection / Document 上的事件摘掉。
+                // 以前只 Shutdown 面板，delegate 还挂在文档上：
+                // netload 二次加载 / 插件重载后，旧委托会再触发一次 Toggle，
+                // 去重建一个已经 Dispose 的窗体。
+                Commands.UnhookCustomLaunchCommand();
+            }
+            catch
+            {
+                // 退出阶段不能再抛异常
+            }
+
             try
             {
                 LibraryPalette.Shutdown();

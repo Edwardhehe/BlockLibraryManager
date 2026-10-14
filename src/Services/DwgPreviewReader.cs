@@ -29,8 +29,13 @@ namespace BlockLibraryManager
     /// </summary>
     public static class DwgPreviewReader
     {
-        /// <summary>单张预览图的体积上限（32MB），防止遇到损坏文件时盲目分配内存。</summary>
-        private const int MaxPreviewBytes = 32 * 1024 * 1024;
+        /// <summary>
+        /// 单张预览图的体积上限（v1.51.12：32MB → 8MB）。
+        /// 缩略图最大 512×512，正常预览段只有几十 KB；32MB 的上限在遇到损坏文件时
+        /// 会真的 `new byte[size]` 分配一块**大对象堆**内存，8 路并发就是 256MB
+        /// 瞬时分配，触发 GC 时主线程一起卡。8MB 足够兜住任何合理文件。
+        /// </summary>
+        private const int MaxPreviewBytes = 8 * 1024 * 1024;
 
         /// <summary>
         /// 预览段定位器指向"起始哨兵(16 字节) + 总长度(4 字节)"，
@@ -51,11 +56,17 @@ namespace BlockLibraryManager
             FileStream fs = null;
             try
             {
-                if (!File.Exists(dwgPath)) return null;
+                // v1.51.12：去掉了这里的 File.Exists —— 调用方 ThumbnailService
+                // 刚刚 stat 过一次（LoadOrExtract），这里是同一份文件的第二次
+                // 元数据 IO，4400 张图就是白白多做 4400 次磁盘查询。
+                // new FileStream 自己会在文件不存在时抛 FileNotFoundException，
+                // 照样被下面的 catch 兜住，行为完全一致。
 
                 // FileShare.ReadWrite：图纸可能正被 CAD 打开着，不能独占
+                // SequentialScan：预览读取本来就是顺序的一次性读，
+                // 告诉系统不要为它做额外的预读优化 / 缓存
                 fs = new FileStream(dwgPath, FileMode.Open, FileAccess.Read,
-                                    FileShare.ReadWrite, 4096, FileOptions.None);
+                                    FileShare.ReadWrite, 8192, FileOptions.SequentialScan);
                 return ReadCore(fs);
             }
             catch

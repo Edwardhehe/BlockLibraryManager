@@ -19,6 +19,10 @@ using AcadMatrix3d = Autodesk.AutoCAD.Geometry.Matrix3d;
 using AcadPoint3d = Autodesk.AutoCAD.Geometry.Point3d;
 using AcadPts = Autodesk.AutoCAD.Geometry.Point3dCollection;
 using AcadExtents3d = Autodesk.AutoCAD.DatabaseServices.Extents3d;
+using AcadDictionary = Autodesk.AutoCAD.DatabaseServices.DBDictionary;
+using AcadLayout = Autodesk.AutoCAD.DatabaseServices.Layout;
+using AcadBlockRef = Autodesk.AutoCAD.DatabaseServices.BlockReference;
+using AcadObjectId = Autodesk.AutoCAD.DatabaseServices.ObjectId;
 
 namespace BlockLibraryManager
 {
@@ -54,7 +58,17 @@ namespace BlockLibraryManager
         /// 一次还没画完的重绘就会抛"参数无效"——这正是历史崩溃的根源。
         /// 只解除引用、交给 GC 回收，是最安全的做法。
         /// </summary>
-        private readonly List<string> _cacheOrder = new List<string>();
+        /// <summary>
+        /// LRU 顺序链（最近使用的在链尾）+ key → 链表节点的索引。
+        ///
+        /// 以前是 List&lt;string&gt;：TouchCache 要 RemoveAll 全扫一遍再 Add，
+        /// 而自绘是"逐项取图"，每取一项就 touch 一次、key 每次都变，
+        /// 于是每一帧都在做 O(600) 的字符串比较 + 数组搬移。
+        /// 改成双链表 + 字典后 Touch 是 O(1)（v1.51.12）。
+        /// </summary>
+        private readonly LinkedList<string> _cacheOrder = new LinkedList<string>();
+        private readonly Dictionary<string, LinkedListNode<string>> _cacheNodes =
+            new Dictionary<string, LinkedListNode<string>>(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>内存缓存最多保留的缩略图张数。</summary>
         private const int MaxMemoryCache = 600;
@@ -85,6 +99,20 @@ namespace BlockLibraryManager
         /// 检测失败的文件不会落盘任何标记，若不记账，每次可见区间变化都会
         /// 重新排队 → 再次 ReadDwgFile 打开 Database → 再次失败，无限循环。</summary>
         private const int MaxMetaRetry = 3;
+
+        /// <summary>
+        /// 同一会话内元数据检测（动态块 / 可见性）的总配额（v1.51.12）。
+        /// 一次检测 = ReadDwgFile 打开 Database + 导出 DXF + 流式解析，
+        /// 主线程上一次几十到几百毫秒。配额覆盖**全部**需要开图纸的情形：
+        ///   · 从没检测过（新图库 / 清过缓存 / 升过版本）—— 数量可达几千；
+        ///   · 旧版写坏的 0 字节 .vis 空壳需要重测 —— 本机实测遗留 1032 个。
+        /// 不限量的话一启动就给它们全排上队，主线程被一轮轮 DxfOut 拖到假死。
+        /// 配额外的留到下次会话：测成功一次就落盘非空标记，永不复发。
+        /// </summary>
+        private const int MaxMetaPerSession = 300;
+
+        /// <summary>本会话已用掉的元数据检测配额。</summary>
+        private int _metaUsed;
 
         /// <summary>同一会话内允许自动重试的最大次数，超过就不再排队（等下次 Resume 清零）。</summary>
         private const int MaxAutoRetry = 3;
@@ -141,8 +169,12 @@ namespace BlockLibraryManager
         private readonly Dictionary<string, int> _visIndex =
             new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-        /// <summary>旧版（可能带黑边）缓存是否已清理。static 保证整个进程只做一次。</summary>
-        private static bool _legacyCacheCleaned;
+        /// <summary>
+        /// 缓存目录的一次性初始化（建目录 + 清旧版缓存 + 容量裁剪）是否已完成。
+        /// volatile：后台预热线程写、主线程读，要保证读到的立刻可见。
+        /// static 保证整个进程只做一次。
+        /// </summary>
+        private static volatile bool _cacheFolderReady;
 
         /// <summary>当前缓存命名版本前缀。升版本会让旧图（含带黑边的、旧动态块判定）自动失效、重新生成。</summary>
         private const string CacheVersionPrefix = "v3_";
@@ -171,6 +203,30 @@ namespace BlockLibraryManager
                     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "BlockLibraryManager", "Thumbnails");
                 return path;
+            }
+        }
+
+        /// <summary>
+        /// 后台预热缓存目录（v1.51.11）。
+        /// 一次性清理（旧版缓存）+ 容量裁剪本来是在第一次 GetCachePath 时同步做的，
+        /// 而首次调用常常发生在主线程上（Prioritize → HasDynamicMeta → GetCachePath），
+        /// 缓存目录上万个小文件时就是一段白白的启动卡顿。这里在线程池上先跑一遍，
+        /// 之后主线程再走到 EnsureCacheFolderReady 时标志位已置好，直接返回。
+        /// </summary>
+        public void WarmUpCacheFolder()
+        {
+            try
+            {
+                string folder = CacheFolder;
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate (object state)
+                {
+                    try { EnsureCacheFolderReady(folder); }
+                    catch { }
+                });
+            }
+            catch
+            {
+                // 预热失败不影响使用，最多是首次取缓存时同步做一次
             }
         }
 
@@ -273,8 +329,28 @@ namespace BlockLibraryManager
                 added++;
             }
 
+            // 一次登记太多（切到大分类 / 首屏）就启动软启动窗口，避免瞬间打满并发
+            if (added > 200)
+                _softStartUntilTick = Environment.TickCount + SoftStartMs;
+
             return added;
         }
+
+        /// <summary>软启动时长（毫秒）：这段时间内只放 SoftStartWorkers 路并发。</summary>
+        private const int SoftStartMs = 3000;
+
+        /// <summary>软启动期间的并发路数。</summary>
+        private const int SoftStartWorkers = 2;
+
+        /// <summary>软启动窗口结束的时间戳（Environment.TickCount）。</summary>
+        private int _softStartUntilTick;
+
+        /// <summary>
+        /// 主线程每轮 ProcessQueue 的时间预算（毫秒）。
+        /// 碰到 Database 的任务（兜底出图、元数据检测）单次就是几十到几百毫秒，
+        /// 超预算必须立刻停工，把剩下的留到下一次 Application.Idle。
+        /// </summary>
+        private const int MainThreadBudgetMs = 40;
 
         /// <summary>
         /// 数据虚拟化：把一批条目（调用方传的是"当前屏幕上看得见的那些"）挪到队列最前面，
@@ -289,6 +365,8 @@ namespace BlockLibraryManager
             if (_suspended) return;
             if (first == null || first.Count == 0) return;
 
+            DropMetaOutOfView(first);
+
             // 缩略图可以从内嵌预览直接取，但"是否动态块 / 有没有可见性状态"必须打开
             // 图纸才知道。只为屏幕上看得见的这几项排一次队——角标本来就只在可见项上画，
             // 看不见的那些根本用不上，没必要为它们开 Database。
@@ -300,12 +378,31 @@ namespace BlockLibraryManager
                 if (item == null || string.IsNullOrEmpty(item.FilePath)) continue;
                 if (!item.IsWholeDrawing) continue;              // 内部块没有独立 DWG
                 if (_metaKeys.Contains(item.Key)) continue;       // 已在队列里
-                if (HasDynamicMeta(item.FilePath)) continue;      // 磁盘上已有检测结论
 
-                // 检测反复失败的（DWG 损坏 / 被占用 / 标记写不进盘）不再重开 Database，
-                // 否则用户每滚一次列表就对这些文件重读一遍，永远停不下来。
+                // ---- 下面三项磁盘判定只算一次 basePath 然后复用（v1.51.12）----
+                // 以前每个条件都各自调一次 HasDynamicMeta / NeedsVisibilityRetest，
+                // 而它们内部各自 GetCachePath（含 MD5）+ 多次 File.Exists：
+                // 单个可见项 = 2 次 MD5 + 5 次磁盘 stat，50 个可见项 × 每次视口变化
+                // 就是几百次无谓 IO，全部落在主线程上。
+                string basePath = GetCachePath(item.FilePath);
+                bool hasMeta = HasDynamicMetaCore(basePath);
+                bool retest = HasRetestMarker(basePath);
+
+                if (hasMeta && !retest) continue;   // 已有结论且不是空壳
+
+                // 失败账本要先判：被熔断的条目不该再吃掉下面的重测配额
                 int metaFails;
-                if (_metaFails.TryGetValue(item.Key, out metaFails) && metaFails >= MaxMetaRetry) continue;
+                if (_metaFails.TryGetValue(item.Key, out metaFails) && metaFails >= MaxMetaRetry)
+                    continue;
+
+                // 从未检测（没有 .dyn/.nodyn）或空壳重测，都要开 Database + 导出 DXF，
+                // 主线程上一次几十到几百毫秒。这里统一按会话配额限流：
+                // 老图库里"从没检测过"的条目是几千量级（新图库/清过缓存/升过版本），
+                // 历史空壳也有上千个，不限量的话一启动就给它们全排上队
+                // = 主线程被 DxfOut 一轮轮拖死（打开面板明显卡顿 / 假死的原因）。
+                // 配额外的留到下次会话慢慢自愈，反正测成功一次就落盘、永不复发。
+                if (_metaUsed >= MaxMetaPerSession) continue;
+                _metaUsed++;
 
                 _metaKeys.Add(item.Key);
                 _meta.Enqueue(item);
@@ -323,6 +420,41 @@ namespace BlockLibraryManager
 
             _pending = Reorder(_pending, front);
             _fallback = Reorder(_fallback, front);
+        }
+
+        /// <summary>
+        /// 把已经滚出视口、却还排在 _meta 队列里的条目丢掉（v1.51.12）。
+        /// _meta 队列以前只进不出：注释写着"只为屏幕上看得见的排队"，实际上条目
+        /// 一旦入队就再不会因为滚出视口被移除。用户在一个两千项的分类里滚一遍，
+        /// _meta 就攒下两千项，之后主线程每轮 Idle 处理一个、每个都要
+        /// ReadDwgFile + DxfOut（几十~几百毫秒），界面会被连续拖住十几分钟。
+        /// 元数据角标本来就只在看得见时才画，这些排队早已失去意义。
+        /// </summary>
+        private void DropMetaOutOfView(ICollection<BlockItem> visible)
+        {
+            if (_meta.Count == 0) return;
+
+            HashSet<string> alive = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (BlockItem item in visible)
+            {
+                if (item != null && !string.IsNullOrEmpty(item.Key)) alive.Add(item.Key);
+            }
+
+            Queue<BlockItem> kept = new Queue<BlockItem>(_meta.Count);
+            while (_meta.Count > 0)
+            {
+                BlockItem item = _meta.Dequeue();
+                if (item == null) continue;
+
+                if (alive.Contains(item.Key)) { kept.Enqueue(item); continue; }
+
+                // 滚出视口：放弃这次检测机会，把配额还回去，并从去重集合里摘掉，
+                // 这样用户滚回来时可以重新入队。
+                _metaKeys.Remove(item.Key);
+                if (_metaUsed > 0) _metaUsed--;
+            }
+
+            _meta = kept;
         }
 
         /// <summary>把队列中命中 front 的条目提到前面，其余保持原相对顺序。</summary>
@@ -378,7 +510,18 @@ namespace BlockLibraryManager
             DrainDone();
 
             // ---- 派活：把等待中的条目投进线程池，直到占满并行额度 ----
-            while (_pending.Count > 0 && _workers < MaxWorkers)
+            //
+            // 软启动（v1.51.11）：刚切到一个大分类时队列里可能一下堆进几千张图，
+            // 8 路并发同时读盘 + 编码，磁盘 / CPU 立刻被吃满，用户感觉 CAD 变卡。
+            // 前 SoftStartMs 毫秒只放 2 路，让界面和 CAD 自己的活先跑起来，之后恢复满并发。
+            // 注意用**差值**比较而不是 TickCount < _softStartUntilTick：
+            // Environment.TickCount 开机 24.8 天后会绕回负数，那时直接比较会
+            // 永远判定"还在软启动窗口内"，把并发死死限制在 2 路。
+            // 差值写法在环绕时依然给出正确结果。
+            bool softStart = (Environment.TickCount - _softStartUntilTick) < 0;
+            int maxWorkers = softStart ? SoftStartWorkers : MaxWorkers;
+
+            while (_pending.Count > 0 && _workers < maxWorkers)
             {
                 BlockItem item = _pending.Dequeue();
                 _pendingKeys.Remove(item.Key);
@@ -400,8 +543,12 @@ namespace BlockLibraryManager
             // 兜底出图：内嵌预览取不到，只能打开 Database 自绘线框
             while (count < maxItems && _fallback.Count > 0)
             {
-                // 时间预算：到点就收工，剩下的等下一次 Idle，界面永远能响应
-                if (count > 0 && Environment.TickCount - startTick > 40) break;
+                // 时间预算：到点就收工，剩下的等下一次 Idle，界面永远能响应。
+                // v1.51.12：去掉了原来的 `count > 0 &&`——那个条件让**第一个任务
+                // 完全不受预算约束**，而兜底单次包含 ReadDwgFile + 渲染 + 可能的
+                // DxfOut，最坏几百毫秒；一轮 Idle 上来就把主线程占掉几百毫秒，
+                // 用户感知就是"点一下卡半天"。现在从第一个起就受 40ms 预算管着。
+                if (Environment.TickCount - startTick > MainThreadBudgetMs) break;
 
                 BlockItem item = _fallback.Dequeue();
                 _fallbackKeys.Remove(item.Key);
@@ -436,9 +583,16 @@ namespace BlockLibraryManager
             }
 
             // 元数据补测：只为屏幕上看得见的条目做（⚡ 角标 / ◀▶ 切换要用）
-            while (count < maxItems && _meta.Count > 0)
+            //
+            // 每轮最多做 1 个（v1.51.11）：一次检测 = ReadDwgFile + DxfOut，
+            // 实测单个就要几十到几百毫秒，而且时间预算只在"做完一个之后"才检查——
+            // 一轮连做 3 个就是持续几百毫秒的卡顿。限成 1 个，把大块时间摊到
+            // 多次 Idle 之间，界面始终有喘息的机会。
+            int metaThisRound = 0;
+            while (count < maxItems && _meta.Count > 0 && metaThisRound < 1)
             {
-                if (count > 0 && Environment.TickCount - startTick > 40) break;
+                if (Environment.TickCount - startTick > MainThreadBudgetMs) break;
+                metaThisRound++;
 
                 BlockItem item = _meta.Dequeue();
                 if (item == null) continue;
@@ -448,12 +602,24 @@ namespace BlockLibraryManager
                 // 否则进度计数差一条、查漏还会把它一遍遍重排（v1.49.1 修）。
                 try
                 {
-                    DetectMetadata(item);
+                    bool visKnown;
+                    DetectMetadata(item, out visKnown);
 
-                    // 检测成功的会落盘 .dyn / .nodyn 标记；什么都没落盘说明这次失败了
-                    //（DWG 打不开 / 文件被占用）。记一笔账，累计到上限后 Prioritize
-                    // 不再为它排队——否则每次可见区间变化都会重开一次 Database。
-                    if (!HasDynamicMeta(item.FilePath))
+                    // 记账标准（v1.51.12）：三个条件都满足才算"检测成功"，缺一odem：
+                    //   · visKnown   —— 可见性这一路真的跑完了（DXF 导出成功）。
+                    //                  v1.51.11 的 bug：DxfOut 失败时 GetVisData 返回
+                    //                  null、磁盘上根本没有 .vis，而 HasDynamicMeta 只看
+                    //                  .dyn 是否存在 → 判成成功 → 把 _metaFails 销账。
+                    //                  后果是该块在本会话内再也不排队、也永不自愈，
+                    //                  用户看到的就是"有闪电、永远没有 ◀ ▶"。
+                    //   · HasDynamicMeta —— 落了 .dyn / .nodyn
+                    //   · !需重测      —— 不是仍未解析出来的 0 字节空壳
+                    string metaBase = GetCachePath(item.FilePath);
+                    bool metaOk = visKnown
+                        && HasDynamicMetaCore(metaBase)
+                        && !HasRetestMarker(metaBase);
+
+                    if (!metaOk)
                     {
                         int metaFails;
                         _metaFails.TryGetValue(item.Key, out metaFails);
@@ -471,7 +637,10 @@ namespace BlockLibraryManager
                     _metaFails[item.Key] = metaFails + 1;
                 }
 
-                RaiseReady(item);
+                // 不计入缩略图进度：_meta 是 Prioritize 排进来的，
+                // 从来没被 BeginThumbRound 登记进 _thumbTotal。
+                // 仍然要通知，否则新测出来的 ⚡ / ◀ ▶ 角标不会立刻画出来。
+                RaiseReady(item, false);
 
                 count++;
             }
@@ -489,36 +658,69 @@ namespace BlockLibraryManager
         {
             System.Threading.Interlocked.Increment(ref _workers);
 
-            System.Threading.ThreadPool.QueueUserWorkItem(delegate(object state)
+            bool queued = true;
+            try
             {
-                BlockItem it = (BlockItem)state;
-                Image image = null;
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate (object state)
+                {
+                    BlockItem it = (BlockItem)state;
+                    Image image = null;
 
-                try
-                {
-                    // 服务已 Dispose（面板销毁 / 插件卸载）时不再出图：
-                    // 结果塞进 _done 也不会再有人来 DrainDone，那张 Bitmap 就泄漏了。
-                    if (!_suspended && !_disposed) image = LoadOrExtract(it);
-                }
-                catch
-                {
-                    image = null;
-                }
-                finally
-                {
-                    if (_disposed && image != null)
+                    try
                     {
-                        try { image.Dispose(); } catch { }
+                        // 服务已 Dispose（面板销毁 / 插件卸载）时不再出图：
+                        // 结果塞进 _done 也不会再有人来 DrainDone，那张 Bitmap 就泄漏了。
+                        if (!_suspended && !_disposed) image = LoadOrExtract(it);
+                    }
+                    catch
+                    {
                         image = null;
                     }
-
-                    lock (_doneLock)
+                    finally
                     {
-                        _done.Add(new KeyValuePair<BlockItem, Image>(it, image));
+                        if ((_disposed || _suspended) && image != null)
+                        {
+                            try { image.Dispose(); } catch { }
+                            image = null;
+                        }
+
+                        // v1.51.12：已经 Dispose / Suspend 的不再往 _done 里塞。
+                        // 以前无条件 Add，服务销毁后 _done 会一直挂着 BlockItem 和
+                        // Bitmap 引用直到被 GC，白白占内存。
+                        if (!_disposed && !_suspended)
+                        {
+                            lock (_doneLock)
+                            {
+                                _done.Add(new KeyValuePair<BlockItem, Image>(it, image));
+                            }
+                        }
+                        else if (image != null)
+                        {
+                            try { image.Dispose(); } catch { }
+                        }
+
+                        System.Threading.Interlocked.Decrement(ref _workers);
                     }
-                    System.Threading.Interlocked.Decrement(ref _workers);
-                }
-            }, item);
+                }, item);
+            }
+            catch
+            {
+                // QueueUserWorkItem 失败（线程池异常 / OOM）——必须把并发槽还回去，
+                // 否则 _workers 永远回不到 0，达到 maxWorkers 后整条并行管道永久停摆，
+                // _pending 再也不出队，用户看到的就是"缩略图突然全部停止更新"。
+                queued = false;
+            }
+
+            if (!queued)
+            {
+                System.Threading.Interlocked.Decrement(ref _workers);
+
+                // 放回队列头部还是队尾都行：这里直接放回 _pending 等下一次调度。
+                // 注意别让它立刻又被无限重试——_failCounts 在 PutCache 时才涨，
+                // 放回队列本身不记失败账，所以不会触发 MaxAutoRetry 熔断。
+                if (_pendingKeys.Add(item.Key))
+                    _pending.Enqueue(item);
+            }
         }
 
         /// <summary>
@@ -597,6 +799,10 @@ namespace BlockLibraryManager
                     // 静默 continue 会让进度条永远停在差一点的位置（例：568/599）。
                     if (HasUsableCache(item.Key))
                     {
+                        // 已经有一张更好的图了，这张新产出的必须释放：
+                        // 每张 24bpp 缩略图是几十到几百 KB 的**非托管** GDI+ 内存，
+                        // 靠 GC 终结器回收不及时，滚几屏就攒出几十 MB。
+                        try { pair.Value.Dispose(); } catch { }
                         RaiseReady(item);
                         continue;
                     }
@@ -638,8 +844,10 @@ namespace BlockLibraryManager
         /// 补测动态块 / 可见性状态元数据。需要打开 Database，只在主线程调用。
         /// 结果会落盘成标记文件，下次启动直接读标记，不用再开一次图纸。
         /// </summary>
-        private void DetectMetadata(BlockItem item)
+        private void DetectMetadata(BlockItem item, out bool visKnown)
         {
+            visKnown = false;
+
             if (item == null || string.IsNullOrEmpty(item.FilePath)) return;
             if (!File.Exists(item.FilePath)) return;
             if (_disposed) return;
@@ -661,25 +869,42 @@ namespace BlockLibraryManager
                     WriteDynamicMarker(item.FilePath);
                     RemovePlainMarker(item.FilePath);
 
-                    // 可见性状态要靠导出 DXF 文本再解析，很贵，只对真动态块做
+                    // 可见性状态要靠导出 DXF 文本再解析，很贵，只对真动态块做。
+                    // 返回值三态（v1.51.11）：
+                    //   null       = DXF 导出/解析本身失败 → **不落标记**，下次会话可重试
+                    //               （内存账本 _metaFails 负责限次，不会无限重开 Database）
+                    //   空列表     = 导出成功、确实没有可见性状态 → 落非空哨兵，永不重测
+                    //   ≥2 个状态  = 正常可见性块 → 落状态名
                     List<string> visStates = DetectVisibilityStateNames(item.Key, db);
                     _visStates[item.Key] = visStates ?? new List<string>();
 
-                    if (visStates != null && visStates.Count >= 2)
+                    if (visStates == null)
+                    {
+                        // 检测没跑完，磁盘上不留结论
+                    }
+                    else if (visStates.Count >= 2)
+                    {
                         WriteVisibilityMarker(item.FilePath, visStates);
+                        visKnown = true;
+                    }
                     else
-                        WriteEmptyVisibilityMarker(item.FilePath);   // 落盘"已检测、无可见性"
+                    {
+                        WriteNoVisibilityMarker(item.FilePath);   // 落盘"已检测、无可见性"
+                        visKnown = true;                          // "确实没有"也是一种确定结论
+                    }
                 }
                 else
                 {
                     // 落盘"已检测、非动态块"，下次直接读标记，省掉一次 ReadDwgFile
                     WritePlainMarker(item.FilePath);
                     _visStates[item.Key] = new List<string>();
+                    visKnown = true;      // 非动态块不需要可见性，结论本身就是确定的
                 }
             }
             catch
             {
-                // 元数据检测失败只影响角标，不影响缩略图
+                // 元数据检测失败只影响角标，不影响缩略图。
+                // visKnown 保持 false：这次没跑完，必须记账而不是销账。
             }
             finally
             {
@@ -747,17 +972,38 @@ namespace BlockLibraryManager
             return GetPlaceholder(item.IsWholeDrawing);
         }
 
-        /// <summary>把 key 标记为最近使用（移到 LRU 队尾）。</summary>
+        /// <summary>
+        /// 把 key 标记为最近使用（移到 LRU 链尾）。
+        /// O(1)：直接从字典拿到节点，摘下来挂到尾部即可。
+        /// </summary>
         private void TouchCache(string key)
         {
             if (string.IsNullOrEmpty(key)) return;
 
-            int last = _cacheOrder.Count - 1;
-            if (last >= 0 && string.Equals(_cacheOrder[last], key, StringComparison.OrdinalIgnoreCase))
-                return;                     // 已经在队尾，最常见的情况，直接返回
+            LinkedListNode<string> node;
+            if (_cacheNodes.TryGetValue(key, out node))
+            {
+                if (ReferenceEquals(node, _cacheOrder.Last)) return;   // 已在队尾，最常见
 
-            _cacheOrder.RemoveAll(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
-            _cacheOrder.Add(key);
+                _cacheOrder.Remove(node);
+                _cacheOrder.AddLast(node);
+                return;
+            }
+
+            node = _cacheOrder.AddLast(key);
+            _cacheNodes[key] = node;
+        }
+
+        /// <summary>把 key 从 LRU 里彻底移除（条目被 Forget / 缓存清空时调用）。</summary>
+        private void DropCacheOrder(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return;
+
+            LinkedListNode<string> node;
+            if (!_cacheNodes.TryGetValue(key, out node)) return;
+
+            _cacheOrder.Remove(node);
+            _cacheNodes.Remove(key);
         }
 
         /// <summary>
@@ -786,9 +1032,10 @@ namespace BlockLibraryManager
 
             while (_cacheOrder.Count > MaxMemoryCache)
             {
-                string oldest = _cacheOrder[0];
-                _cacheOrder.RemoveAt(0);
-                _memoryCache.Remove(oldest);
+                LinkedListNode<string> oldest = _cacheOrder.First;
+                _cacheOrder.RemoveFirst();
+                _cacheNodes.Remove(oldest.Value);
+                _memoryCache.Remove(oldest.Value);
             }
         }
 
@@ -881,8 +1128,60 @@ namespace BlockLibraryManager
         {
             try
             {
-                string basePath = GetCachePath(dwgPath);
+                return HasDynamicMetaCore(GetCachePath(dwgPath));
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 重载：直接吃已经算好的缓存路径。
+        /// 调用方往往在同一轮里既要判 hasMeta 又要判 retest，复用已经算出的
+        /// basePath 可避免重复调用 GetCachePath（含 MD5 与路径查表）。
+        /// 名字加 Core 是为了与单参版本区分——同名重载会让 GetCachePath(dwgPath)
+        /// 的字符串结果匹配到单参版本，形成无限递归。
+        /// </summary>
+        private static bool HasDynamicMetaCore(string basePath)
+        {
+            try
+            {
                 return File.Exists(basePath + ".dyn") || File.Exists(basePath + ".nodyn");
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private bool NeedsVisibilityRetest(string dwgPath)
+        {
+            try
+            {
+                return HasRetestMarker(GetCachePath(dwgPath));
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 该块的 .vis 是不是"0 字节空壳"（重载：复用已算好的缓存路径）。
+        /// 空壳 = 旧版 DXF 解析失败时写的假"已检测"（v1.51.9），必须允许重测，
+        /// 否则这些块永远没有 ◀ ▶ 切换按钮。
+        /// 注意 v1.51.11 起正常分支写的是非空哨兵 "-"，所以这里判定的是
+        /// **历史遗留**空壳，新写的结论永远不会再被判成需要重测。
+        /// </summary>
+        private static bool HasRetestMarker(string basePath)
+        {
+            try
+            {
+                if (!File.Exists(basePath + ".dyn")) return false;   // 非动态块不用测
+                string vis = basePath + ".vis";
+                if (!File.Exists(vis)) return false;                 // 没写过可见性标记 → 不是空壳
+                return new FileInfo(vis).Length == 0;                // 0 字节 = 假"已检测"
             }
             catch
             {
@@ -937,7 +1236,8 @@ namespace BlockLibraryManager
                     foreach (string line in File.ReadAllLines(marker, System.Text.Encoding.UTF8))
                     {
                         string name = (line ?? string.Empty).Trim();
-                        if (name.Length > 0 && !states.Contains(name)) states.Add(name);
+                        // "-" 是"已检测、无可见性状态"的哨兵（v1.51.11），不是状态名
+                        if (name.Length > 0 && name != "-" && !states.Contains(name)) states.Add(name);
                     }
                 }
             }
@@ -984,6 +1284,9 @@ namespace BlockLibraryManager
         /// 可见性数据没有托管 API，通过把侧数据库导出成 DXF 再解析
         /// BLOCKVISIBILITYPARAMETER 对象（303 状态名 / 94 数量 / 331 可见实体句柄）获得。
         /// </summary>
+        /// <summary>本会话已记录的"解析为空"条数（日志限流，见 GetVisData）。</summary>
+        private static int _emptyVisLogged;
+
         private List<VisParamData> GetVisData(string itemKey, AcadDb db)
         {
             if (string.IsNullOrEmpty(itemKey)) return null;
@@ -998,10 +1301,24 @@ namespace BlockLibraryManager
             {
                 db.DxfOut(dxfPath, 0, Autodesk.AutoCAD.DatabaseServices.DwgVersion.Current);
                 data = ParseDxfVisibility(dxfPath);
+
+                // "导出成功但没有可见性状态"是正常的（大部分动态块没有可见性参数），
+                // 一条一条写日志会把 error.log 刷爆（实测一天 1100+ 行）。本会话限 20 条。
+                if (data.Count == 0 && _emptyVisLogged < 20)
+                {
+                    _emptyVisLogged++;
+                    BlmLog.Write("可见性状态解析为空（该动态块没有可见性参数，属正常）：" + itemKey
+                        + (_emptyVisLogged >= 20 ? "  （本会话后续同类消息不再记录）" : string.Empty));
+                }
             }
-            catch
+            catch (System.Exception ex)
             {
-                data = new List<VisParamData>();
+                BlmLog.Write("DXF 导出失败（可见性检测）：item=" + itemKey + "，" +
+                    (ex.Message ?? string.Empty).Replace("\r", " ").Replace("\n", " "));
+
+                // 返回 null = "这次没跑成"，与"跑成了但没找到状态"（空列表）区分开。
+                // 不缓存 null：下次还能再试一次（v1.51.11）
+                return null;
             }
             finally
             {
@@ -1012,21 +1329,45 @@ namespace BlockLibraryManager
             return data;
         }
 
-        /// <summary>解析 DXF 文本里全部 BLOCKVISIBILITYPARAMETER 对象的状态与可见实体句柄。</summary>
+        /// <summary>
+        /// 解析 DXF 对象段里的可见性状态（v1.51.9 第三版，按真实 DXF 样本核对过）。
+        ///
+        /// 真实结构（AutoCAD 2020 accoreconsole 导出的 DXF 实测）：**没有**
+        /// BLOCKVISIBILITYSTATE 对象，全部数据都在 BLOCKVISIBILITYPARAMETER
+        /// 对象体的 AcDbBlockVisibilityParameter 段内：
+        /// <code>
+        ///   0   BLOCKVISIBILITYPARAMETER
+        ///   100 AcDbEvalExpr / AcDbBlockElement（300 = 参数名，不要动）
+        ///   100 AcDbBlockParameter / AcDbBlock1PtParameter（这里有 93！必须忽略）
+        ///   100 AcDbBlockVisibilityParameter     ← 从这里才开始解析
+        ///   301 &lt;参数名&gt;   302 &lt;空&gt;   91 &lt;0&gt;
+        ///    93 &lt;N&gt;  → 331 × N                    ← 受控实体全集
+        ///    92 &lt;状态数&gt;
+        ///    循环 × 状态数：
+        ///     303 &lt;状态名&gt;
+        ///      94 &lt;N&gt; → 332 × N                  ← 该状态**可见**实体
+        ///      95 &lt;M&gt; → 333 × M                  ← 该状态**隐藏**实体
+        /// </code>
+        /// 332 是可见实体：实测"单开 4 → 双开 5 → 三开 6"递增累加，语义吻合。
+        /// AllControlled = 331 全集 ∪ 各状态 333（333 里的实体在所有状态都隐藏，
+        /// 不并入 Controlled 的话渲染时会被当成"不受控"永远显示出来）。
+        /// </summary>
         private static List<VisParamData> ParseDxfVisibility(string dxfPath)
         {
             List<VisParamData> result = new List<VisParamData>();
 
             try
             {
-                // 流式解析：DXF 动辄几十 MB，一次性 ReadAllLines 会把整个文件读进内存，
-                // 解析一个图块就顶一次内存峰值。改成边读边解析，内存占用恒定。
+                // 流式解析：DXF 动辄几十 MB，一次性 ReadAllLines 会把整个文件读进内存。
                 // （detectEncodingFromByteOrderMarks=true，自动识别 UTF-8 BOM）
                 using (StreamReader reader = new StreamReader(
                     dxfPath, System.Text.Encoding.UTF8, true))
                 {
-                    VisParamData param = null;
-                    HashSet<long> current = null;
+                    VisParamData param = null;      // 当前 BLOCKVISIBILITYPARAMETER
+                    bool inBody = false;            // 已进入 AcDbBlockVisibilityParameter 段
+                    string stateName = null;        // 当前状态名
+                    HashSet<long> visible = null;   // 当前状态可见实体（挂在 param.StateHandles）
+                    int pending = 0;                // 等待收集的句柄组：331/332/333
                     int remain = 0;
 
                     // DXF 文本严格"组码行 + 值行"成对出现，所以两行两行地读
@@ -1040,82 +1381,160 @@ namespace BlockLibraryManager
 
                         string code = codeLine.Trim();
 
+                        if (code == "102")
+                        {
+                            // reactor 块（102 {ACAD_REACTORS ... 102 }）里的 330 是
+                            // owner 句柄，混进实体句柄会污染过滤集合，整块跳过
+                            while (true)
+                            {
+                                string skipCode = reader.ReadLine();
+                                if (skipCode == null) break;
+                                string skipValue = reader.ReadLine();
+                                if (skipValue == null) break;
+                                if (skipCode.Trim() == "102" && skipValue.Trim().StartsWith("}"))
+                                    break;
+                            }
+                            continue;
+                        }
+
                         if (code == "0")
                         {
-                            // 新对象开始：先把正在解析的可见性参数收尾
+                            // 对象切换：先收尾当前参数（333 并入受控集、判定是否可用）
                             if (param != null)
                             {
-                                AddIfUseful(result, param);
-                                param = null;
-                                current = null;
-                                remain = 0;
+                                FinishVisParam(result, param);
+                                param = null; inBody = false;
+                                stateName = null; visible = null; pending = 0;
                             }
 
                             if (string.Equals(valueLine.Trim(), "BLOCKVISIBILITYPARAMETER",
                                     StringComparison.OrdinalIgnoreCase))
+                            {
                                 param = new VisParamData();
-
+                            }
                             continue;
                         }
 
-                        if (param == null) continue;   // 不在可见性参数对象里，跳过
+                        if (param == null) continue;
 
-                        if (code == "303")
+                        if (code == "100")
                         {
-                            string name = DecodeDxfText(valueLine).Trim();
-                            if (name.Length == 0) name = "状态" + (param.StateHandles.Count + 1);
-                            if (!param.StateHandles.ContainsKey(name))
-                                param.StateHandles[name] = new HashSet<long>();
-                            current = param.StateHandles[name];
-                            remain = 0;
+                            // 段名切换：只有真正进入可见性段才开始收数据
+                            // （AcDbBlock1PtParameter 段里也有 93，不能让它触发收集）
+                            inBody = string.Equals(valueLine.Trim(),
+                                "AcDbBlockVisibilityParameter", StringComparison.OrdinalIgnoreCase);
+                            pending = 0;
+                            continue;
                         }
-                        else if (code == "94")
+
+                        if (!inBody) continue;
+
+                        if (code == "93")                       // 受控实体全集数量 → 331 × N
                         {
-                            int.TryParse(valueLine.Trim(), out remain);
+                            pending = 331;
+                            remain = ParseInt(valueLine);
                         }
-                        else if (code == "331")
+                        else if (code == "331" && pending == 331 && remain > 0)
                         {
-                            long handle;
-                            if (current != null && remain > 0 &&
-                                long.TryParse(valueLine.Trim(),
-                                    System.Globalization.NumberStyles.HexNumber,
-                                    System.Globalization.CultureInfo.InvariantCulture, out handle))
+                            long h;
+                            if (TryParseHandle(valueLine, out h)) param.AllControlled.Add(h);
+                            remain--;
+                        }
+                        else if (code == "92")                  // 状态总数（提示性，忽略）
+                        {
+                            pending = 0;
+                        }
+                        else if (code == "303")                 // 状态名 → 开新状态
+                        {
+                            // 解码失败就当原始文本，别把一个状态名的转义异常放大成
+                            // "整份 DXF 解析失败"（见 PaintDxfText 与外层 catch 的说明）
+                            string n = valueLine.Trim();
+                            try
                             {
-                                current.Add(handle);
-                                param.AllControlled.Add(handle);
-                                remain--;
+                                n = DecodeDxfText(valueLine).Trim();
                             }
+                            catch { }
+
+                            if (n.Length == 0) n = "状态" + (param.StateHandles.Count + 1);
+                            // 重名兜底（理论上一参数内不重名）
+                            while (param.StateHandles.ContainsKey(n))
+                                n = n + "_";
+                            stateName = n;
+                            visible = new HashSet<long>();
+                            param.StateHandles[n] = visible;
+                            pending = 0;
+                        }
+                        else if (code == "94")                  // 可见实体数量 → 332 × N
+                        {
+                            pending = 332;
+                            remain = ParseInt(valueLine);
+                        }
+                        else if (code == "332" && pending == 332 && remain > 0 && visible != null)
+                        {
+                            long h;
+                            if (TryParseHandle(valueLine, out h)) visible.Add(h);
+                            remain--;
+                        }
+                        else if (code == "95")                  // 隐藏实体数量 → 333 × N
+                        {
+                            pending = 333;
+                            remain = ParseInt(valueLine);
+                        }
+                        else if (code == "333" && pending == 333 && remain > 0)
+                        {
+                            // 隐藏实体直接并入受控全集：IsVisible 逻辑是
+                            // "受控且不在当前状态可见集 → 隐藏"，333 不并入就永远显示
+                            long h;
+                            if (TryParseHandle(valueLine, out h)) param.AllControlled.Add(h);
+                            remain--;
                         }
                     }
 
-                    // 文件结束时收尾最后一个参数
-                    if (param != null) AddIfUseful(result, param);
+                    // 文件收尾
+                    if (param != null)
+                        FinishVisParam(result, param);
                 }
             }
             catch
             {
-                result.Clear();
+                // v1.51.12：以前这里是 `result.Clear()` —— 把**整份文件**已经解析出来的
+                // 可见性参数全部作废。配合下面 DecodeDxfText 的越界异常，一个状态名
+                // 转义不合法就让这个块彻底失去 ◀ ▶，而且因为落了哨兵还会永不重试。
+                // 部分解析结果不完美，也比全丢要好得多；这里保留已解析到的部分。
             }
 
             return result;
         }
 
         /// <summary>
-        /// 只收"至少两个状态、且确实解析到可见实体"的可见性参数，
-        /// 过滤掉解析残缺的坏块（否则切换按钮会出现但点了没反应）。
+        /// 收尾一个可见性参数：至少两个"解析到了可见实体"的状态才收进结果，
+        /// 过滤解析残缺的坏块（否则切换按钮会出现但点了没反应）。
         /// </summary>
-        private static void AddIfUseful(List<VisParamData> result, VisParamData param)
+        private static void FinishVisParam(List<VisParamData> result, VisParamData param)
         {
-            if (param == null || param.StateHandles.Count < 2) return;
+            if (param == null || param.AllControlled.Count == 0) return;
 
+            int usable = 0;
             foreach (HashSet<long> set in param.StateHandles.Values)
-            {
-                if (set.Count > 0)
-                {
-                    result.Add(param);
-                    return;
-                }
-            }
+                if (set.Count > 0) usable++;
+
+            if (usable >= 2) result.Add(param);
+        }
+
+        /// <summary>解析组码数值行。</summary>
+        private static int ParseInt(string text)
+        {
+            int v;
+            int.TryParse((text ?? string.Empty).Trim(), out v);
+            return v;
+        }
+
+        /// <summary>解析 DXF 句柄（十六进制文本）。</summary>
+        private static bool TryParseHandle(string text, out long handle)
+        {
+            return long.TryParse((text ?? string.Empty).Trim(),
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out handle);
         }
 
         /// <summary>解码 DXF 文本中的 \U+XXXX Unicode 转义（中文状态名常见）。</summary>
@@ -1127,7 +1546,13 @@ namespace BlockLibraryManager
             System.Text.StringBuilder sb = new System.Text.StringBuilder(text.Length);
             for (int i = 0; i < text.Length; i++)
             {
-                if (i + 5 < text.Length + 1 && i + 6 <= text.Length &&
+                // v1.51.12 修：老条件的有效部分是 `i + 6 <= text.Length`，
+                // 但下面要的是 Substring(i + 3, 4)，实际需要 `i + 7 <= length`。
+                // 文件末尾正好截在转义中途时（例如状态名 @"\U+123" 丢了最后一位），
+                // Substring 会抛 ArgumentOutOfRangeException，一路冒泡到解析器的
+                // 最外层 catch —— 以前那里是 result.Clear()，整份 DXF 的可见性
+                // 结果全丢。改成正确的边界，缺尾就当普通文本处理。
+                if (i + 7 <= text.Length &&
                     text[i] == '\\' && text[i + 1] == 'U' && text[i + 2] == '+' )
                 {
                     int code;
@@ -1215,13 +1640,25 @@ namespace BlockLibraryManager
         /// 与 .nodyn 同理：空文件本身不影响 GetVisibilityStates（读出来就是空列表），
         /// 但能避免同一个动态块每次启动都被重复导出一次 DXF 去解析。
         /// </summary>
-        private void WriteEmptyVisibilityMarker(string dwgPath)
+        /// <summary>
+        /// 落盘"已检测、该动态块没有可见性状态"（v1.51.11）。
+        ///
+        /// 这里**必须写非空哨兵**，不能像旧版那样写 0 字节文件：
+        /// NeedsVisibilityRetest 把"0 字节 .vis"当成旧版解析失败留下的空壳来重测，
+        /// 而"动态块但没有可见性参数"是正常结论、永远解析不出状态 —— 写空文件
+        /// 等于给这 1000 多个块判了无期徒刑：每个会话都要重开 Database + 导出 DXF，
+        /// 主线程被一轮轮 DxfOut 拖住，表现就是打开图库时明显卡顿 / 假死。
+        /// 哨兵内容 "-" 不是状态名，GetVisibilityStates 读标记时会跳过。
+        /// </summary>
+        private void WriteNoVisibilityMarker(string dwgPath)
         {
             try
             {
                 string marker = GetCachePath(dwgPath) + ".vis";
-                if (!File.Exists(marker))
-                    File.WriteAllBytes(marker, new byte[0]);
+                // 已经是"有状态"的标记就别覆盖
+                if (File.Exists(marker) && new FileInfo(marker).Length > 1) return;
+
+                File.WriteAllText(marker, "-", System.Text.Encoding.UTF8);
             }
             catch
             {
@@ -1261,43 +1698,36 @@ namespace BlockLibraryManager
                         (Autodesk.AutoCAD.DatabaseServices.BlockTable)tr.GetObject(
                             db.BlockTableId, AcadOpenMode.ForRead);
 
-                    HashSet<Autodesk.AutoCAD.DatabaseServices.ObjectId> referenced =
-                        new HashSet<Autodesk.AutoCAD.DatabaseServices.ObjectId>();
+                    HashSet<AcadObjectId> referenced = new HashSet<AcadObjectId>();
 
-                    // 第一遍：遍历所有布局空间（模型 + 图纸）中的块参照
-                    foreach (Autodesk.AutoCAD.DatabaseServices.ObjectId btrId in bt)
+                    // v1.51.12：第一遍原本是"遍历块表、逐个 GetObject 看 IsLayout"——
+                    // 一张含 3000 个块定义的图纸就是 3000 次无谓打开，只为找那几个布局。
+                    // 直接走 LayoutDictionary，只打开布局对象的 BlockTableRecordId。
+                    AcadDictionary layoutDict = tr.GetObject(db.LayoutDictionaryId, AcadOpenMode.ForRead)
+                        as AcadDictionary;
+
+                    if (layoutDict != null)
                     {
-                        AcadBtr btr = tr.GetObject(btrId, AcadOpenMode.ForRead) as AcadBtr;
-                        if (btr == null || !btr.IsLayout) continue;
-
-                        foreach (Autodesk.AutoCAD.DatabaseServices.ObjectId entId in btr)
+                        foreach (System.Collections.DictionaryEntry entry in layoutDict)
                         {
-                            Autodesk.AutoCAD.DatabaseServices.BlockReference br =
-                                tr.GetObject(entId, AcadOpenMode.ForRead) as
-                                    Autodesk.AutoCAD.DatabaseServices.BlockReference;
-                            if (br == null) continue;
+                            AcadLayout layout =
+                                tr.GetObject((AcadObjectId)entry.Value, AcadOpenMode.ForRead) as AcadLayout;
+                            if (layout == null) continue;
 
-                            // 动态块实例：参照指向的动态定义与其原始定义不一致
-                            //（2020 程序集的 BlockReference 没有 IsDynamic 属性，用这个等价判断）
-                            bool isDynamicRef;
-                            try { isDynamicRef = br.BlockTableRecord != br.DynamicBlockTableRecord; }
-                            catch { isDynamicRef = false; }
+                            AcadBtr btr = tr.GetObject(layout.BlockTableRecordId, AcadOpenMode.ForRead)
+                                as AcadBtr;
+                            if (btr == null) continue;
 
-                            if (isDynamicRef)
-                            {
-                                tr.Commit();
-                                return true;    // 动态块实例，直接判定
-                            }
-
-                            referenced.Add(br.BlockTableRecord);
+                            if (CollectReferences(tr, btr, referenced)) { tr.Commit(); return true; }
                         }
                     }
 
-                    // 第二遍：被引用的块定义中存在动态块定义
-                    foreach (Autodesk.AutoCAD.DatabaseServices.ObjectId btrId in bt)
+                    // 第二遍原本又全表扫一遍 bt（再 3000 次 GetObject），
+                    // 实际只需要看**被引用到的**那几十个块定义。
+                    foreach (AcadObjectId refId in referenced)
                     {
-                        AcadBtr btr = tr.GetObject(btrId, AcadOpenMode.ForRead) as AcadBtr;
-                        if (btr != null && btr.IsDynamicBlock && referenced.Contains(btrId))
+                        AcadBtr btr = tr.GetObject(refId, AcadOpenMode.ForRead) as AcadBtr;
+                        if (btr != null && btr.IsDynamicBlock)
                         {
                             tr.Commit();
                             return true;
@@ -1315,6 +1745,41 @@ namespace BlockLibraryManager
             return false;
         }
 
+        /// <summary>
+        /// 遍历一个布局里的块参照：把被引用的块定义记进 referenced。
+        /// 返回 true 表示已经找到动态块实例，调用方可直接收工。
+        /// </summary>
+        private static bool CollectReferences(AcadTr tr, AcadBtr btr, HashSet<AcadObjectId> referenced)
+        {
+            try
+            {
+                foreach (AcadObjectId entId in btr)
+                {
+                    AcadBlockRef br = null;
+                    try { br = tr.GetObject(entId, AcadOpenMode.ForRead) as AcadBlockRef; }
+                    catch { br = null; }
+
+                    if (br == null) continue;
+
+                    // 动态块实例：参照指向的动态定义与其原始定义不一致
+                    // （2020 程序集的 BlockReference 没有 IsDynamic 属性，用这个等价判断）
+                    bool isDynamicRef;
+                    try { isDynamicRef = br.BlockTableRecord != br.DynamicBlockTableRecord; }
+                    catch { isDynamicRef = false; }
+
+                    if (isDynamicRef) return true;
+
+                    referenced.Add(br.BlockTableRecord);
+                }
+            }
+            catch
+            {
+                // 某个实体打不开不影响其余部分
+            }
+
+            return false;
+        }
+
         /// <summary>汇总解析到的可见性状态名（跨全部可见性参数去重，保持出现顺序）。</summary>
         private List<string> DetectVisibilityStateNames(string itemKey, AcadDb db)
         {
@@ -1322,7 +1787,7 @@ namespace BlockLibraryManager
             try
             {
                 List<VisParamData> data = GetVisData(itemKey, db);
-                if (data == null) return states;
+                if (data == null) return null;          // 导出失败：让调用方知道"没跑成"
 
                 foreach (VisParamData param in data)
                 {
@@ -1500,6 +1965,8 @@ namespace BlockLibraryManager
         {
             _memoryCache.Clear();
             _cacheOrder.Clear();
+            _cacheNodes.Clear();        // 与 _cacheOrder 必须同步清，否则节点索引会指向已摘下的节点
+            _cachePathCache.Clear();    // ThumbSize 可能已变，缓存路径要重算
             _pendingKeys.Clear();
             _pending.Clear();
             _fallback.Clear();
@@ -1507,6 +1974,9 @@ namespace BlockLibraryManager
             _meta.Clear();
             _metaKeys.Clear();
             _visIndex.Clear();
+            _visData.Clear();           // 随磁盘 PNG 一起作废的可见性解析结果也必须丢
+            _visStates.Clear();
+            _dynamicFlags.Clear();
 
             // 失败账本也必须一起清：切底色 / 改规格后所有图都要重出，
             // 而 _failCounts 记到上限的条目会被 RequestThumbnails 无条件跳过，
@@ -1562,10 +2032,11 @@ namespace BlockLibraryManager
                 string key = "file:" + filePath.ToLowerInvariant();
 
                 _memoryCache.Remove(key);
-                _cacheOrder.RemoveAll(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase));
+                DropCacheOrder(key);
                 _dynamicFlags.Remove(key);
                 _visStates.Remove(key);
                 _visData.Remove(key);
+                _visIndex.Remove(key);
                 _failCounts.Remove(key);
                 _metaFails.Remove(key);
 
@@ -1591,8 +2062,67 @@ namespace BlockLibraryManager
             }
         }
 
+        /// <summary>
+        /// 目录树右键"刷新"：只清指定文件夹（含子目录）下所有 DWG 的缩略图痕迹——
+        /// 内存缓存、磁盘 PNG、动态块 / 可见性标记、失败账本，其它文件夹一概不动。
+        /// 返回清掉的 DWG 文件数（0 = 该文件夹下没有 DWG）。
+        /// </summary>
+        public int InvalidateFolder(string folderPath)
+        {
+            if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath)) return 0;
+
+            List<string> dwgs = new List<string>();
+
+            try
+            {
+                // 顶层 + 子目录（图库默认按目录树展示，块可能藏在子目录里）
+                dwgs.AddRange(Directory.GetFiles(folderPath, "*.dwg", SearchOption.TopDirectoryOnly));
+                foreach (string sub in Directory.GetDirectories(folderPath))
+                {
+                    try
+                    {
+                        dwgs.AddRange(Directory.GetFiles(sub, "*.dwg", SearchOption.AllDirectories));
+                    }
+                    catch
+                    {
+                        // 无权限的子目录跳过
+                    }
+                }
+            }
+            catch
+            {
+                return 0;
+            }
+
+            foreach (string dwg in dwgs) ForgetItem(dwg);
+            return dwgs.Count;
+        }
+
         private void RaiseReady(BlockItem item)
         {
+            RaiseReady(item, true);
+        }
+
+        /// <summary>
+        /// 通知界面"这个条目有变化了"（v1.51.12 增加 counted 参数）。
+        ///
+        /// counted = true  表示这条通知要计入本轮缩略图进度（调用方靠
+        ///                 ThumbnailReady 的次数闭合 BeginThumbRound 登记的 _thumbTotal）。
+        /// counted = false 用于**元数据补测**这类从不计入 _thumbTotal 的完成通知：
+        ///                 它仍然要让界面重绘（角标出现/消失），但不能动进度计数
+        ///                 —— 否则 _thumbDone 会被不属于本轮的条目推着走，
+        ///                 状态栏会出现"已全部生成"但数字对不上的现象。
+        /// </summary>
+        private void RaiseReady(BlockItem item, bool counted)
+        {
+            Action<BlockItem, bool> typed = ThumbnailReadyCounted;
+            if (typed != null)
+            {
+                try { typed(item, counted); }
+                catch { /* 回调异常不能中断队列处理 */ }
+                return;
+            }
+
             Action<BlockItem> handler = ThumbnailReady;
             if (handler != null)
             {
@@ -1600,6 +2130,9 @@ namespace BlockLibraryManager
                 catch { /* 回调异常不能中断队列处理 */ }
             }
         }
+
+        /// <summary>带"是否计入进度"标记的完成事件（订阅它就能拿到精确的计数语义）。</summary>
+        public event Action<BlockItem, bool> ThumbnailReadyCounted;
 
         // ---------- 生成 ----------
 
@@ -1639,10 +2172,20 @@ namespace BlockLibraryManager
                     List<string> visStates = DetectVisibilityStateNames(item.Key, db);
                     _visStates[item.Key] = visStates ?? new List<string>();
 
-                    if (visStates != null && visStates.Count >= 2)
+                    // 同 DetectMetadata 的三态约定（v1.51.11）：
+                    // null = 没跑成（不落标记，下次还能重试）；空 = 确实没有可见性状态（落哨兵）
+                    if (visStates == null)
+                    {
+                        // 检测没跑完，磁盘上不留结论
+                    }
+                    else if (visStates.Count >= 2)
+                    {
                         WriteVisibilityMarker(item.FilePath, visStates);
+                    }
                     else
-                        WriteEmptyVisibilityMarker(item.FilePath);
+                    {
+                        WriteNoVisibilityMarker(item.FilePath);
+                    }
                 }
                 else
                 {
@@ -1815,10 +2358,23 @@ namespace BlockLibraryManager
             }
         }
 
-        /// <summary>把一条折线加进结果并累计范围。</summary>
+        /// <summary>
+        /// 单张兜底渲染的几何量上限（v1.51.12 新增熔断）。
+        ///
+        /// 以前这条路上没有任何上限：一张 10 万实体的图纸会展开出十几万个
+        /// Point3d，AppendEntityGeometry 里每条曲线固定采样 33 点，最后
+        /// RenderPreview 用 DrawLine 逐段画 —— 几百万条线段在主线程跑好几秒，
+        /// **完全不受 ProcessQueue 的 40ms 预算约束**（预算只在"做完一个任务之后"才检查）。
+        /// 用户遇到这种图就是彻底卡死。6000 条折线足够把一张图的外形画清楚。
+        /// </summary>
+        private const int MaxRenderPolylines = 6000;
+
+        /// <summary>把一条折线加进结果并累计范围（超过熔断上限后静默丢弃）。</summary>
         private static void AddPolyline(AcadPts pts, List<AcadPts> polylines, BoundsAcc bounds)
         {
             if (pts == null || pts.Count < 2) return;
+            if (polylines.Count >= MaxRenderPolylines) return;
+
             for (int i = 0; i < pts.Count; i++) bounds.AddPoint(pts[i]);
             polylines.Add(pts);
         }
@@ -1881,6 +2437,10 @@ namespace BlockLibraryManager
                         catch { }
                     }
 
+                    // 注意：这里**不能**按"块定义"去重。几何是带着各自的
+                    // BlockTransform 变换到世界坐标收集的，同一个定义放在 200 个
+                    // 不同位置会产生 200 份不同的世界坐标几何 —— 一旦按定义去重，
+                    // 画面上就只剩第一个实例。控制开销只能靠 AddPolyline 的熔断。
                     foreach (Autodesk.AutoCAD.DatabaseServices.ObjectId id in btr)
                     {
                         AcadEntity child = tr.GetObject(id, AcadOpenMode.ForRead) as AcadEntity;
@@ -2070,18 +2630,35 @@ namespace BlockLibraryManager
 
         // ---------- 缓存 ----------
 
+        /// <summary>
+        /// 文件路径 → 缓存 PNG 路径的映射表（v1.51.12）。
+        /// GetCachePath 是全局调用最密集的方法之一：自绘每一项、每次排队、
+        /// 每次查标记文件都会走到。以前它每次都现算一次 MD5，现在算一次就记住。
+        /// 字典本身随条目数增长（几万张图也不过几 MB），超过上限直接整体丢弃重建。
+        /// </summary>
+        private readonly Dictionary<string, string> _cachePathCache =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        private const int MaxCachePathEntries = 20000;
+
         private string GetCachePath(string dwgPath)
         {
-            string key;
-            if (string.IsNullOrEmpty(dwgPath)) key = "unknown";
-            else key = Md5(dwgPath.ToLowerInvariant());
+            string pathKey;
+            if (string.IsNullOrEmpty(dwgPath)) pathKey = "unknown";
+            else pathKey = dwgPath.ToLowerInvariant();
 
-            int size = _config.ThumbSize;
-            string folder = CacheFolder;
+            string result;
+            if (_cachePathCache.TryGetValue(pathKey, out result)) return result;
 
-            EnsureCacheFolderReady(folder);
+            string hash = string.Equals(pathKey, "unknown", StringComparison.Ordinal)
+                ? "unknown" : Md5(pathKey);
 
-            return Path.Combine(folder, CacheVersionPrefix + key + "_" + size + ".png");
+            result = Path.Combine(CacheFolder,
+                CacheVersionPrefix + hash + "_" + _config.ThumbSize + ".png");
+
+            if (_cachePathCache.Count >= MaxCachePathEntries) _cachePathCache.Clear();
+            _cachePathCache[pathKey] = result;
+            return result;
         }
 
         /// <summary>缓存目录的一次性初始化（清旧版缓存 + 容量裁剪）。</summary>
@@ -2094,128 +2671,127 @@ namespace BlockLibraryManager
         /// </summary>
         private static void EnsureCacheFolderReady(string folder)
         {
-            if (_legacyCacheCleaned && _diskCachePruned) return;
+            if (_cacheFolderReady) return;
 
+            // 注意：这个方法**不再**由 GetCachePath 调用（v1.51.12）。
+            // 以前 GetCachePath 每次都跑一遍这里，而 PruneDiskCacheOnce 在
+            // "缓存没超上限"的正常路径上是 `return` 且**不置位**标志的，
+            // 于是标志永远为 false —— 每次取缓存路径都要：
+            //     ① new DirectoryInfo(folder).GetFiles("v3_*.png")  全目录枚举
+            //     ② 抢一把 static 全局锁 _cacheInitLock
+            // 缓存目录上万个小文件时，这是"打开面板就假死"的头号元凶：
+            // 自绘每一项都要 IsDynamicBlock → GetCachePath，8 路后台 worker
+            // 还会在这把全局锁上全部串行化，所谓并行退化成串行。
+            // 现在它只由 WarmUpCacheFolder 在后台线程跑一次，与关键路径彻底解耦。
             lock (_cacheInitLock)
             {
-                CleanLegacyCacheOnce(folder);
-                PruneDiskCacheOnce(folder);
+                if (_cacheFolderReady) return;
+
+                try
+                {
+                    if (!Directory.Exists(folder))
+                        Directory.CreateDirectory(folder);
+
+                    CleanAndPruneCacheOnce(folder);
+                }
+                catch
+                {
+                    // 清理失败不影响使用，只是旧文件多占点磁盘
+                }
+                finally
+                {
+                    // 无论走哪个分支都必须置位，否则下次还会重来一遍（这正是老 bug）
+                    _cacheFolderReady = true;
+                }
             }
         }
 
         /// <summary>
-        /// 清理旧版本缓存（文件名不带 v2_ 前缀的 PNG）。
-        /// 旧图是带着右缘黑边生成的，留着也没用；删掉让它们按新逻辑重新生成。
-        /// 只在第一次用到缓存目录时执行一次。
+        /// 清旧版缓存 + 容量裁剪，合并成**一次**目录枚举（v1.51.12）。
+        /// 以前是先 GetFiles("*") 删旧版、再 GetFiles("v3_*.png") 裁剪，
+        /// 缓存目录上万个小文件时等于扫两遍。现在一次枚举就把三件事做完：
+        /// 删除非当前版本前缀的遗留文件、统计当前版本缓存、记录访问时间用于淘汰。
         /// </summary>
-        private static void CleanLegacyCacheOnce(string folder)
+        private static void CleanAndPruneCacheOnce(string folder)
         {
-            if (_legacyCacheCleaned) return;
+            List<FileInfo> keep = new List<FileInfo>();
+            int deletedLegacy = 0;
 
+            foreach (string file in Directory.GetFiles(folder))
+            {
+                string name = Path.GetFileName(file);
+
+                bool isCache = name.EndsWith(".png", StringComparison.OrdinalIgnoreCase);
+                bool isMarker = name.EndsWith(".png.dyn", StringComparison.OrdinalIgnoreCase)
+                    || name.EndsWith(".png.vis", StringComparison.OrdinalIgnoreCase)
+                    || name.EndsWith(".png.nodyn", StringComparison.OrdinalIgnoreCase);
+
+                if (!isCache && !isMarker) continue;
+
+                // 旧版本留下的文件（前面版本算法不同，留着只会误导），直接删
+                if (!name.StartsWith(CacheVersionPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    try { File.Delete(file); deletedLegacy++; } catch { }
+                    continue;
+                }
+
+                // 当前版本的 PNG 留着参与容量裁剪；标记文件不占配额
+                if (isCache)
+                {
+                    try { keep.Add(new FileInfo(file)); } catch { }
+                }
+            }
+
+            if (deletedLegacy > 0)
+                BlmLog.Write("已清理旧版本缩略图缓存 " + deletedLegacy + " 个文件");
+
+            if (keep.Count <= MaxDiskCacheFiles) return;
+
+            // 超过上限：按最后访问时间升序淘汰最久没用的一批
             try
             {
-                if (!Directory.Exists(folder)) return;
-
-                foreach (string file in Directory.GetFiles(folder, "*.png"))
-                {
-                    string name = Path.GetFileName(file);
-                    if (name.StartsWith(CacheVersionPrefix, StringComparison.OrdinalIgnoreCase)) continue;
-
-                    try { File.Delete(file); } catch { }
-                }
-
-                // 旧版本的动态块标记文件（.png.dyn）与可见性状态标记（.png.vis）一并清理
-                foreach (string file in Directory.GetFiles(folder, "*.png.dyn"))
-                {
-                    string name = Path.GetFileName(file);
-                    if (name.StartsWith(CacheVersionPrefix, StringComparison.OrdinalIgnoreCase)) continue;
-
-                    try { File.Delete(file); } catch { }
-                }
-
-                foreach (string file in Directory.GetFiles(folder, "*.png.vis"))
-                {
-                    string name = Path.GetFileName(file);
-                    if (name.StartsWith(CacheVersionPrefix, StringComparison.OrdinalIgnoreCase)) continue;
-
-                    try { File.Delete(file); } catch { }
-                }
-
-                // 旧版的"非动态块"标记（.png.nodyn）同样要清，否则会一直堆积
-                foreach (string file in Directory.GetFiles(folder, "*.png.nodyn"))
-                {
-                    string name = Path.GetFileName(file);
-                    if (name.StartsWith(CacheVersionPrefix, StringComparison.OrdinalIgnoreCase)) continue;
-
-                    try { File.Delete(file); } catch { }
-                }
-
-                // 删除跑完才置位：标志位是给别的线程"可以看缓存了"的信号，
-                // 提前置位会让另一路 worker 在删除进行中去读这些 PNG。
-                _legacyCacheCleaned = true;
-            }
-            catch
-            {
-                // 清理失败不影响使用，只是旧文件多占点磁盘
-            }
-        }
-
-        /// <summary>磁盘缓存 PNG 数量上限，超出后按最后访问时间淘汰最旧的。</summary>
-        private const int MaxDiskCacheFiles = 4000;
-
-        private static bool _diskCachePruned;
-
-        /// <summary>
-        /// 磁盘缓存容量控制。图库越用越大、换过缩略图尺寸或底色后，
-        /// 旧 PNG 会一直堆在 %LOCALAPPDATA% 里；这里在每次进程启动时检查一次，
-        /// 超过上限就删掉最久没被用到的一批（连带它的 .dyn / .vis 标记文件），
-        /// 避免缓存目录无限膨胀。被删的图块下次打开时会重新生成，不影响使用。
-        /// </summary>
-        private static void PruneDiskCacheOnce(string folder)
-        {
-            if (_diskCachePruned) return;
-
-            try
-            {
-                if (!Directory.Exists(folder)) return;
-
-                FileInfo[] files = new DirectoryInfo(folder).GetFiles(CacheVersionPrefix + "*.png");
-                if (files.Length <= MaxDiskCacheFiles) return;
-
-                // 按最后访问时间升序：最久没用过的排在前面，优先删
-                Array.Sort(files, delegate(FileInfo a, FileInfo b)
+                keep.Sort(delegate (FileInfo a, FileInfo b)
                 {
                     try { return a.LastAccessTimeUtc.CompareTo(b.LastAccessTimeUtc); }
                     catch { return 0; }
                 });
-
-                // 一次多留 5% 余量，避免之后每加一张就又要排序删一次
-                int keep = (int)(MaxDiskCacheFiles * 0.95);
-
-                for (int i = 0; i < files.Length - keep; i++)
-                {
-                    string path = files[i].FullName;
-                    try { files[i].Delete(); } catch { }
-
-                    try
-                    {
-                        // 三种标记文件都要跟着删，漏掉 .nodyn 会让缓存目录只增不减——
-                        // 而且容量统计是按 *.png 算的，永远统计不到它们。
-                        if (File.Exists(path + ".dyn")) File.Delete(path + ".dyn");
-                        if (File.Exists(path + ".nodyn")) File.Delete(path + ".nodyn");
-                        if (File.Exists(path + ".vis")) File.Delete(path + ".vis");
-                    }
-                    catch { }
-                }
-
-                // 与清理旧缓存同理：删完才置位
-                _diskCachePruned = true;
             }
             catch
             {
-                // 清理失败不影响使用，只是缓存多占点磁盘
+                return;      // 排序失败就跳过裁剪，不影响使用
             }
+
+            // 一次多留 5% 余量，避免之后每加一张就又要排序删一次
+            int keepCount = (int)(MaxDiskCacheFiles * 0.95);
+            int remove = keep.Count - keepCount;
+            if (remove <= 0) return;
+
+            for (int i = 0; i < remove; i++)
+            {
+                string path = keep[i].FullName;
+                try { keep[i].Delete(); } catch { }
+
+                try
+                {
+                    // 三种标记文件都要跟着删，漏掉 .nodyn 会让缓存目录只增不减——
+                    // 而且容量统计是按 *.png 算的，永远统计不到它们。
+                    DeleteSilently(path + ".dyn");
+                    DeleteSilently(path + ".nodyn");
+                    DeleteSilently(path + ".vis");
+                }
+                catch { }
+            }
+
+            BlmLog.Write("磁盘缩略图缓存已裁剪 " + remove + " 个旧文件（上限 " + MaxDiskCacheFiles + "）");
         }
+
+        private static void DeleteSilently(string path)
+        {
+            try { File.Delete(path); } catch { }
+        }
+
+        /// <summary>磁盘缓存 PNG 数量上限，超出后按最后访问时间淘汰最旧的。</summary>
+        private const int MaxDiskCacheFiles = 4000;
 
         private static string Md5(string text)
         {
@@ -2418,12 +2994,23 @@ namespace BlockLibraryManager
             // 释放后任何一次重绘都会抛"参数无效"。只解除引用，由 GC 统一回收。
             _memoryCache.Clear();
             _cacheOrder.Clear();
+            _cacheNodes.Clear();
+            _cachePathCache.Clear();
             _pendingKeys.Clear();
             _pending.Clear();
             _fallback.Clear();
             _fallbackKeys.Clear();
             _meta.Clear();
             _metaKeys.Clear();
+
+            // 这几个字典里装着每个图块一份的元数据（可见性状态里可能有上千个句柄），
+            // 面板销毁后服务对象若还被引用，这些内存就是纯泄漏。
+            _dynamicFlags.Clear();
+            _visStates.Clear();
+            _visData.Clear();
+            _visIndex.Clear();
+            _failCounts.Clear();
+            _metaFails.Clear();
 
             lock (_doneLock) { _done.Clear(); }
 

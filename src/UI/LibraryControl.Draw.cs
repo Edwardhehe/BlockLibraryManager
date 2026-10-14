@@ -38,6 +38,61 @@ namespace BlockLibraryManager
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
+        // ---------------- 目录树节点自绘 ----------------
+
+        /// <summary>
+        /// 目录树节点文字自绘（v1.51.13）。
+        ///
+        /// 为什么要自绘：模态对话框（设置 / 关于）打开时，WinForms 会把面板窗口
+        /// **禁用**；系统的 TreeView 通用控件在窗口被禁用后重绘时，会用默认的
+        /// 系统窗口色（白）画节点文字的底 —— 深色主题下就是用户截图里那一片片
+        /// 白斑。TVM_SETBKCOLOR 设的深色底对这段"禁用态重绘"不生效，无解。
+        ///
+        /// 把文字抢过来自己画：底色 / 文字色 / 选中高亮 / 悬停全部走主题，
+        /// 无论窗口是否被禁用、是否失活，画出来的永远是主题色。
+        /// 展开 +/- 与连接线仍由系统画（颜色走 ApplyTheme 里的 LineColor）。
+        /// </summary>
+        private void OnTreeDrawNode(object sender, DrawTreeNodeEventArgs e)
+        {
+            if (e.Node == null) return;
+
+            UiTheme t = CurrentTheme;
+
+            bool selected = (e.State & TreeNodeStates.Selected) != 0;
+            bool hot = (e.State & TreeNodeStates.Hot) != 0;
+
+            // 底色：选中 > 悬停 > 常规；文字同理。全部取自主题，深浅主题都成立。
+            Color back = t.ListBack;
+            Color fore = t.BodyText;
+            if (hot) { back = t.HeaderBack; fore = t.BodyText; }
+            if (selected) { back = t.ChromeBack; fore = t.HeaderText; }
+
+            // 面板被模态窗口禁用时把文字稍微调暗一点，让"不可交互"有视觉反馈，
+            // 同时也避免与"正常态"看起来完全一样。
+            if (!_tree.Enabled) fore = t.HintText;
+
+            if (e.Bounds.Width > 0 && e.Bounds.Height > 0)
+            {
+                using (SolidBrush b = new SolidBrush(back))
+                    e.Graphics.FillRectangle(b, e.Bounds);
+            }
+
+            if (!string.IsNullOrEmpty(e.Node.Text) && e.Bounds.Width > 3)
+            {
+                Font font = e.Node.NodeFont ?? _tree.Font;
+                Rectangle r = new Rectangle(
+                    e.Bounds.X + 1, e.Bounds.Y, e.Bounds.Width - 2, e.Bounds.Height);
+                TextRenderer.DrawText(e.Graphics, e.Node.Text, font, r, fore, back,
+                    TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.SingleLine |
+                    TextFormatFlags.NoPrefix |
+                    TextFormatFlags.EndEllipsis);
+            }
+
+            // 注意：这里绝不设 e.DrawDefault = true —— 那会把节点交回系统绘制，
+            // 白底问题就会回来。
+        }
+
         /// <summary>ImageList 里那张透明占位图的键名（只为撑尺寸，永远不会被画出来）。</summary>
         private const string PlaceholderImageKey = "__blm_placeholder__";
 
@@ -80,19 +135,26 @@ namespace BlockLibraryManager
         /// </summary>
         private void EnsurePlaceholderImage()
         {
-            if (_imageList == null) return;
+            AddPlaceholderTo(_imageList);
+            AddPlaceholderTo(_smallImageList);      // 详情 / 列表视图那份（v1.51.12）
+        }
+
+        private static void AddPlaceholderTo(ImageList list)
+        {
+            if (list == null) return;
 
             try
             {
-                if (_imageList.Images.ContainsKey(PlaceholderImageKey)) return;
+                if (list.Images.ContainsKey(PlaceholderImageKey)) return;
 
-                int size = _imageList.ImageSize.Width;
+                int size = list.ImageSize.Width;
                 if (size < 8) size = 8;
 
                 // 注意：这里**不能** Dispose 这张图。ImageList 会持有原对象引用，
                 // 句柄延后创建时还要用它来生成原生位图（早释放会抛"参数无效"）。
                 Bitmap bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
-                _imageList.Images.Add(PlaceholderImageKey, bmp);
+                try { list.Images.Add(PlaceholderImageKey, bmp); }
+                catch { try { bmp.Dispose(); } catch { } throw; }
             }
             catch
             {
@@ -160,9 +222,12 @@ namespace BlockLibraryManager
 
             // 只有真正要被画出来的项才会走到这一步 —— 屏幕外的项永远取不到图
             Image img = GetItemImage(lvi);
+
             if (img != null) DrawImageFitted(g, img, iconRect);
 
-            DrawItemOverlays(g, lvi.Tag as BlockItem, iconRect);
+            // 角标一律贴"实际画出来的缩略图矩形"定位（与点击判定共用 GetDrawnImageRect）
+            Rectangle drawnRect = GetDrawnImageRect(lvi, itemBounds, iconRect);
+            DrawItemOverlays(g, lvi.Tag as BlockItem, iconRect, drawnRect);
 
             // 文字：大图标视图在图下方居中；列表视图（View.List）在图右侧
             Rectangle textRect;
@@ -275,11 +340,39 @@ namespace BlockLibraryManager
                 itemBounds.Y, side, side);
         }
 
-        /// <summary>把图等比画进矩形（居中、不放大）。</summary>
-        private static void DrawImageFitted(Graphics g, Image img, Rectangle rect)
+        /// <summary>
+        /// 该项缩略图"实际画出来"的矩形（等比缩放居中后的结果）。
+        /// **绘制角标与点击判定必须共用这一个方法**——两边各算一次、基准不一致
+        /// 就会出现"按钮看得见却点不中 / 点中的地方没按钮"。没图（含占位图取不到）
+        /// 时退回 iconRect，保证角标位置不会跳。
+        /// </summary>
+        private Rectangle GetDrawnImageRect(ListViewItem lvi, Rectangle itemBounds, Rectangle iconRect)
         {
-            if (img == null || img.Width <= 0 || img.Height <= 0) return;
-            if (rect.Width <= 0 || rect.Height <= 0) return;
+            try
+            {
+                if (iconRect.Width <= 0 || iconRect.Height <= 0)
+                    iconRect = GetIconRect(lvi, itemBounds);
+
+                Image img = GetItemImage(lvi);
+                if (img == null) return iconRect;
+
+                Rectangle fitted = GetFittedRect(img, iconRect);
+                return (fitted.Width > 0 && fitted.Height > 0) ? fitted : iconRect;
+            }
+            catch
+            {
+                return iconRect;
+            }
+        }
+
+        /// <summary>
+        /// 计算把图等比缩放居中放进 rect 后"实际绘制"的矩形（不放大）。
+        /// 角标定位与绘制共用这一个算法，保证画在哪、贴哪是一致的。
+        /// </summary>
+        private static Rectangle GetFittedRect(Image img, Rectangle rect)
+        {
+            if (img == null || img.Width <= 0 || img.Height <= 0) return Rectangle.Empty;
+            if (rect.Width <= 0 || rect.Height <= 0) return Rectangle.Empty;
 
             double scale = Math.Min((double)rect.Width / img.Width, (double)rect.Height / img.Height);
             if (scale > 1.0) scale = 1.0;          // 小图不放大，避免糊
@@ -287,13 +380,21 @@ namespace BlockLibraryManager
             int w = Math.Max(1, (int)Math.Round(img.Width * scale));
             int h = Math.Max(1, (int)Math.Round(img.Height * scale));
 
+            return new Rectangle(rect.X + (rect.Width - w) / 2,
+                                 rect.Y + (rect.Height - h) / 2, w, h);
+        }
+
+        /// <summary>把图等比画进矩形（居中、不放大）。</summary>
+        private static void DrawImageFitted(Graphics g, Image img, Rectangle rect)
+        {
+            Rectangle target = GetFittedRect(img, rect);
+            if (target.Width <= 0 || target.Height <= 0) return;
+
             InterpolationMode old = g.InterpolationMode;
             try
             {
                 g.InterpolationMode = InterpolationMode.HighQualityBilinear;
-                g.DrawImage(img,
-                    new Rectangle(rect.X + (rect.Width - w) / 2,
-                                  rect.Y + (rect.Height - h) / 2, w, h));
+                g.DrawImage(img, target);
             }
             finally
             {
@@ -304,25 +405,34 @@ namespace BlockLibraryManager
         /// <summary>
         /// 叠加动态块闪电角标与可见性 ◀ ▶ 按钮。
         /// 以前这些是"烤"进一张复制出来的 Bitmap 里的（每个动态块一份拷贝），
-        /// 现在改成绘制期叠加：零拷贝、且缩略图更新时不用重建位图。
+        /// 现在改成绘制期叠加：零拷贝、且缩略图更新时不用重建位图，
+        /// **缩略图缓存文件 / 缓存位图保持原样，不含任何角标**。
+        /// imgRect 是图标格子（可见性 ◀ ▶ 的画与点击判定都用它）；
+        /// imageRect 是缩略图等比缩放居中后"实际画出来"的矩形（闪电贴它定位）。
         /// </summary>
-        private void DrawItemOverlays(Graphics g, BlockItem item, Rectangle imgRect)
+        private void DrawItemOverlays(Graphics g, BlockItem item, Rectangle imgRect, Rectangle imageRect)
         {
             if (item == null || _thumbnails == null) return;
             if (!_thumbnails.IsDynamicBlock(item)) return;
 
             try
             {
-                DrawDynamicBadge(g, imgRect);
+                // 闪电叠加在缩略图自身右上角（不是格子右上角——
+                // 横向长图上下留白时按格子定位会飘到图外，v1.51.9）
+                if (imageRect.Width > 0 && imageRect.Height > 0)
+                    DrawDynamicBadge(g, imageRect);
 
                 List<string> states = _thumbnails.GetVisibilityStates(item);
                 if (states != null && states.Count >= 2)
                 {
-                    // 用与点击判定完全相同的比例算位置，画和点才对得上
-                    Rectangle prev = GetPrevTriangleRect(imgRect.Width, imgRect.Height);
-                    prev.Offset(imgRect.Location);
-                    Rectangle next = GetNextTriangleRect(imgRect.Width, imgRect.Height);
-                    next.Offset(imgRect.Location);
+                    // 三角按钮也贴着"实际画出来的缩略图"底部（与闪电同一基准），
+                    // 且用与点击判定完全相同的算法算位置，画和点才对得上（v1.51.9）。
+                    // 之前按格子定位：横向长图上下留白 → 按钮画在图下方的空白里，
+                    // 看起来像"没实现"。
+                    Rectangle prev = GetPrevTriangleRect(imageRect.Width, imageRect.Height);
+                    prev.Offset(imageRect.Location);
+                    Rectangle next = GetNextTriangleRect(imageRect.Width, imageRect.Height);
+                    next.Offset(imageRect.Location);
 
                     DrawTriangleButton(g, prev, true);
                     DrawTriangleButton(g, next, false);
@@ -334,13 +444,21 @@ namespace BlockLibraryManager
             }
         }
 
-        /// <summary>右上角的手绘矢量闪电（细长锐利造型，白色描边保证深色图上也醒目）。</summary>
-        private static void DrawDynamicBadge(Graphics g, Rectangle imgRect)
+        /// <summary>右上角的手绘矢量闪电（细长锐利造型，白色描边保证深色图上也醒目）。
+        /// 坐标基于"实际画出来的缩略图矩形"（imageRect），叠加在上、不进缓存。</summary>
+        private static void DrawDynamicBadge(Graphics g, Rectangle imageRect)
         {
-            float s = Math.Max(8f, Math.Min(imgRect.Width, imgRect.Height) / 8.4f);
+            float s = Math.Max(8f, Math.Min(imageRect.Width, imageRect.Height) / 8.4f);
+
+            // 缩略图太小就不叠了，免得闪电把图盖没
+            if (imageRect.Width < s * 1.8f || imageRect.Height < s * 1.8f) return;
+
+            // 离缩略图上边、右边各留 10px（用户指定，v1.51.9）
+            const float margin = 10f;
+
             float boltW = s * 0.72f;
-            float x0 = imgRect.Right - boltW - 2f;      // 右缘留 2px
-            float y0 = imgRect.Top + 2f;                // 顶缘留 2px
+            float x0 = imageRect.Right - boltW - margin;
+            float y0 = imageRect.Top + margin;
 
             PointF[] bolt = new PointF[]
             {
@@ -392,6 +510,16 @@ namespace BlockLibraryManager
                 int perPage = (int)Math.Min(perPageRaw, count);
                 if (firstVisible < 0) firstVisible = 0;
 
+                int now = Environment.TickCount;
+                bool sweepDue = _thumbnails.PendingCount <= 0 && (now - _lastThumbSweepTick) >= 2000;
+                bool rangeChanged = firstVisible != _lastTopIndex || perPage != _lastPerPage;
+
+                // v1.51.12：Application.Idle 每秒能来几十次，而下面要建一个
+                // "可见项"列表（几十个百分点成员的堆分配）。区间没变、又不到
+                // 查漏时间的话直接早退 —— 以前是无条件每帧都分配这个列表，
+                // 连续滚动时等于每一帧分配一次几十项的集合。
+                if (!rangeChanged && !sweepDue) return;
+
                 // 多带一屏：往下滚的时候下一屏已经在排队了
                 int last = Math.Min(count - 1, firstVisible + perPage);
                 if (last < firstVisible) return;
@@ -403,8 +531,7 @@ namespace BlockLibraryManager
                 // 可见项里若有还没出图的（此前生成失败、缓存存了 null、画面上是"DWG"占位），
                 // 自动重新排队重试。只在队列空闲时每 2 秒扫一次，开销可忽略；
                 // 服务端有失败计数上限，真坏文件不会陷入无限重试。
-                int now = Environment.TickCount;
-                if (_thumbnails.PendingCount <= 0 && now - _lastThumbSweepTick >= 2000)
+                if (sweepDue)
                 {
                     _lastThumbSweepTick = now;
 
@@ -425,8 +552,8 @@ namespace BlockLibraryManager
                     }
                 }
 
-                // 区间没变就不重排队列（每帧只多花两次 SendMessage）
-                if (firstVisible == _lastTopIndex && perPage == _lastPerPage) return;
+                // 区间没变就不重排队列
+                if (!rangeChanged) return;
                 _lastTopIndex = firstVisible;
                 _lastPerPage = perPage;
 

@@ -71,6 +71,16 @@ namespace BlockLibraryManager
         ///      前两条都成立，于是 BLOCKLIB 又去执行 Hide，用户再怎么输命令
         ///      窗口都不出现（本次修的就是这条）。
         /// </summary>
+        /// <summary>
+        /// 面板是否"真的看得见"（v1.51.12 补齐两个漏判）。
+        ///
+        /// 关键情形：ShowModelessDialog 让面板归属 CAD 主窗口，
+        /// **CAD 主窗口最小化时面板跟着消失**，但此时
+        ///     Form.Visible == true、WindowState == Normal、IsOnScreen == true
+        /// ——老的三条判定全过，后台缩略图仍在 Application.Idle 上开 DWG /
+        /// 解码 / 重采样，用户看到的就是"图库明明关了，CAD 还是一直卡"。
+        /// 另外窗口被摆到屏幕外（副屏拔掉、显示器重排）时也必须算不可见。
+        /// </summary>
         internal static bool IsEffectivelyVisible
         {
             get
@@ -79,10 +89,36 @@ namespace BlockLibraryManager
                 {
                     if (_form == null || !_form.Visible) return false;
                     if (_form.WindowState == FormWindowState.Minimized) return false;
+                    if (!IsHostOnScreen()) return false;      // ← 新增：宿主最小化判定
                     return IsOnScreen();
                 }
                 catch { return false; }
             }
+        }
+
+        /// <summary>上次真正去探 Win32 可见性的时间戳（Idle 里 500ms 节流用）。</summary>
+        private static int _lastVisibleCheckTick;
+
+        /// <summary>上次探到的可见性结果（供 Im 在两次探测之间复用）。</summary>
+        private static bool _lastVisibleCheck;
+
+        /// <summary>
+        /// 宿主窗口（CAD 主窗口）是否处于可见状态。
+        /// 拿不到句柄时按"可见"处理——宁可多干一点活，也不能因为误判把面板停死。
+        /// </summary>
+        private static bool IsHostOnScreen()
+        {
+            try
+            {
+                IntPtr host = _form != null ? _form.HostWindowHandle : IntPtr.Zero;
+                if (host == IntPtr.Zero) return true;
+
+                // 宿主最小化 → 面板跟着不可见
+                if (NativeWindow.IsMinimized(host)) return false;
+                // 面板自身句柄的 WS_VISIBLE 位
+                return NativeWindow.IsVisible(_form.Handle);
+            }
+            catch { return true; }
         }
 
         /// <summary>窗口在屏幕几何上是否找得着。取不到句柄时按"找得着"处理，避免误判。</summary>
@@ -196,8 +232,12 @@ namespace BlockLibraryManager
         {
             if (!IsCreated) return;
 
-            if (_control != null)
-                _control.ReloadLibrary(true);
+            // v1.51.12：原来走的是 ReloadLibrary(true)，那条路在 **Modal 命令里
+            // 主线程同步整盘重扫**（几千个 DWG 逐个建对象，无任何进度提示），
+            // 命令执行期间 CAD 完全无响应 —— 用户说的"卡顿假死"最典型的来源。
+            // 换成与首次加载、粘贴入库、批量入库同一条的后台路径：
+            // 后台线程扫描 + 延迟出现的进度条。
+            if (_control != null) _control.ReloadWithProgress(null);
         }
 
         /// <summary>打开设置对话框（命令 BLOCKLIBS 使用）。</summary>
@@ -212,7 +252,14 @@ namespace BlockLibraryManager
             }
 
             _config.Save();
-            _control.Initialize(_config);
+
+            // v1.51.12：改完设置不要再走 Initialize()。
+            // Initialize 会无条件 Dispose 重建 ThumbnailService + LibraryIndex，
+            // 等于把用户攒下的全部内存 / 磁盘缩略图缓存一次性作废 —— 回到面板
+            // 就是满屏占位图重新出一遍，几千张图要重新开始。
+            // SettingsForm 改的是同一个 _config 实例，应用新设置 + 重载即可；
+            // 面板内那颗"设置"按钮本来就是这么做的（Events.cs OnSettingsClick）。
+            _control.ApplySettings();
         }
 
         /// <summary>打开“关于”对话框（工具栏“关于”按钮使用）。</summary>
@@ -948,9 +995,9 @@ namespace BlockLibraryManager
 
             try
             {
-                bool visible = _form != null &&
-                               _form.Visible &&
-                               _form.WindowState != FormWindowState.Minimized;
+                // 同样套用统一判定（见 OnApplicationIdle 的说明）：
+                // 面板跟着 CAD 主窗口最小化、或被摆到屏幕外时都要停工。
+                bool visible = _form != null && IsEffectivelyVisible;
 
                 if (visible) _control.ResumeThumbnailWork();
                 else _control.SuspendThumbnailWork();
@@ -1108,12 +1155,21 @@ namespace BlockLibraryManager
 
             try
             {
-                // 窗口看不见（已关闭 / 已最小化）时一次都不进处理逻辑。
-                // 这里的 SuspendThumbnailWork 是兜底：万一某个改变可见性的入口
-                // 漏了同步，空闲循环也会在第一时间把后台工作停掉，
-                // 不会让 AutoCAD 在用户看不见面板时还一直忙着生成缩略图。
-                if (_form != null &&
-                    (!_form.Visible || _form.WindowState == FormWindowState.Minimized))
+                // 改用统一的 IsEffectivelyVisible（含宿主最小化 + 屏幕几何判定）：
+                // 以前这里只判 Visible && WindowState，CAD 主窗口最小化 / 窗口跑到
+                // 屏幕外时会漏判，后台缩略图继续在 Idle 上跑 —— "关掉面板 CAD 还卡"。
+                //
+                // 一次完整判定要 3 个 Win32 调用（IsIconic / IsWindowVisible / GetWindowRect
+                // + MonitorFromWindow），而 Application.Idle 每秒能来几十次。
+                // 500ms 探一次足够跟上用户的操作节奏，不用每帧都问（v1.51.12）。
+                int now = Environment.TickCount;
+                if (now - _lastVisibleCheckTick >= 500)
+                {
+                    _lastVisibleCheckTick = now;
+                    _lastVisibleCheck = IsEffectivelyVisible;
+                }
+
+                if (!_lastVisibleCheck)
                 {
                     _control.SuspendThumbnailWork();
                     return;

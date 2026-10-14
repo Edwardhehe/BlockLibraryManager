@@ -61,6 +61,16 @@ namespace BlockLibraryManager
         private ImageList _imageList;
 
         /// <summary>
+        /// 详情视图 / 列表视图专用的小图标列表（v1.51.12）。
+        /// 它的尺寸只决定这两种视图的行高，必须独立于"缩略图规格"，
+        /// 否则 ThumbSize 调到 256 时每一行就变成 256px 高。
+        /// </summary>
+        private ImageList _smallImageList;
+
+        /// <summary>详情 / 列表视图行内图标的尺寸（固定，不随缩略图规格变）。</summary>
+        private const int DetailRowIconSize = 32;
+
+        /// <summary>
         /// 当前在目录树"此电脑"分支中浏览的文件夹。空串 = 未在浏览电脑文件夹。
         /// </summary>
         private string _pcSelectedPath = string.Empty;
@@ -164,6 +174,7 @@ namespace BlockLibraryManager
         private ContextMenuStrip _menuList;
         private ContextMenuStrip _menuTree;
         private ToolStripMenuItem _miTreeOpenFolder;
+        private ToolStripMenuItem _miTreeRefresh;
         private ToolStripMenuItem _miTreeRemove;
 
         /// <summary>目录树右键菜单里的"添加到收藏夹 / 从收藏夹移除"项。</summary>
@@ -221,6 +232,13 @@ namespace BlockLibraryManager
             _thumbnails.WhiteBackground = IsWhiteThumbBackground;
             _thumbnails.ThumbnailReady += OnThumbnailReady;
 
+            // 精确计数版本：只有它才能区分"计入进度"和"仅重绘"（元数据补测）
+            _thumbnails.ThumbnailReadyCounted += OnThumbnailReady;
+
+            // 缓存目录的一次性清理 / 容量裁剪丢到后台做（上万小文件的目录扫描，
+            // 留在主线程上就是启动阶段一段无谓的卡顿，v1.51.11）
+            _thumbnails.WarmUpCacheFolder();
+
             _index = new LibraryIndex(_config, new Func<string, IList<string>>(BlockInsertService.GetBlockNames));
 
             ApplyConfigToUi();
@@ -232,6 +250,40 @@ namespace BlockLibraryManager
             // 二来可以显示进度条（见 ScheduleInitialLoad / OnVisibleChanged）。
             _pendingInitialLoad = true;
             if (Visible && IsHandleCreated) ScheduleInitialLoad();
+        }
+
+        /// <summary>
+        /// 改完设置后的**轻量**重配（v1.51.12）。
+        ///
+        /// 以前"设置"保存后走的是 Initialize()，那里面无条件把 ThumbnailService
+        /// 和 LibraryIndex Dispose 重建一遍 —— 全部内存 / 磁盘缩略图缓存瞬间作废，
+        /// 回到面板就是几千张图从头重新出一遍。
+        /// 设置对话框改的是同一个 _config 实例，只要把差异应用到 UI，
+        /// 必要时再重载列表就够了，没有任何理由销毁缓存。
+        /// </summary>
+        public void ApplySettings()
+        {
+            if (_config == null) return;
+
+            try
+            {
+                // 语言可以在设置里改，必须早于任何界面文字刷新
+                LanguageService.ConfiguredLanguage = _config.Language ?? string.Empty;
+
+                if (_thumbnails != null)
+                    _thumbnails.WhiteBackground = IsWhiteThumbBackground;
+
+                ApplyConfigToUi();
+                ApplyLanguage();
+                ApplyTheme();
+
+                // 过滤器 / 是否搜索子目录等会改变列表内容，交给后台重载
+                ReloadWithProgress(GetSelectedCategoryPath());
+            }
+            catch (System.Exception ex)
+            {
+                BlmLog.Write("应用设置失败", ex);
+            }
         }
 
         /// <summary>是否还欠着一次首次加载。</summary>
@@ -599,6 +651,11 @@ namespace BlockLibraryManager
             _imageList.ColorDepth = ColorDepth.Depth32Bit;
             _imageList.ImageSize = new Size(96, 96);
 
+            // 详情 / 列表视图行内的图标尺寸，固定值、不随缩略图规格变
+            _smallImageList = new ImageList();
+            _smallImageList.ColorDepth = ColorDepth.Depth32Bit;
+            _smallImageList.ImageSize = new Size(DetailRowIconSize, DetailRowIconSize);
+
             CreateToolStrip();
             CreateParamPanel();     // 必须先于 CreateSplit：面板要被放进左侧分割容器
             CreateSplit();
@@ -741,7 +798,9 @@ namespace BlockLibraryManager
                 if (_tree != null)
                 {
                     _tree.BackColor = t.ListBack;
-                    _tree.ForeColor = t.BodyText;   // 节点文字跟随主题
+                    _tree.ForeColor = t.BodyText;   // 节点文字跟随主题（DrawNode 用）
+                    _tree.LineColor = t.Border;     // 展开 +/- 与连接线跟随主题（默认黑色在深色底上看不见）
+                    _tree.Invalidate();             // 自绘节点按新主题立即重画
                 }
                 if (_list != null)
                 {
@@ -800,9 +859,12 @@ namespace BlockLibraryManager
                         Label lbl = c as Label;
                         if (lbl == null) continue;
 
+                        // v1.51.12：补上 _lblCloseHint。它创建时也是 DimGray，
+                        // 但漏在判断之外 → 切主题后被刷成正文色，比上面三行提示亮一大截。
                         if (ReferenceEquals(lbl, _lblLayerHint) ||
                             ReferenceEquals(lbl, _lblColorHint) ||
-                            ReferenceEquals(lbl, _lblExplodeHint))
+                            ReferenceEquals(lbl, _lblExplodeHint) ||
+                            ReferenceEquals(lbl, _lblCloseHint))
                             lbl.ForeColor = t.HintText;
                         else
                             lbl.ForeColor = t.BodyText;
@@ -1023,6 +1085,15 @@ namespace BlockLibraryManager
             _tree.FullRowSelect = true;
             _tree.HotTracking = true;
 
+            // v1.51.13：节点文字改为自绘（DrawNode）。
+            // 原因：设置 / 关于这类模态对话框打开时会把面板窗口禁用，系统的
+            // TreeView 通用控件在"窗口被禁用后重绘"时会用**默认窗口色（白）**
+            // 画节点文字的底，深色主题下就是一块块白斑（用户截图实证）。
+            // 文字全部由我们画（底色 / 文字色都走主题），白斑不再可能出现；
+            // 展开线颜色也在 ApplyTheme 里跟随主题 Border。
+            _tree.DrawMode = TreeViewDrawMode.OwnerDrawText;
+            _tree.DrawNode += new DrawTreeNodeEventHandler(OnTreeDrawNode);
+
             // 节点图标：Windows 资源管理器原生的文件夹图标（关闭 / 打开两态）
             _treeIcons = new ImageList();
             _treeIcons.ColorDepth = ColorDepth.Depth32Bit;
@@ -1067,8 +1138,9 @@ namespace BlockLibraryManager
             _list = new ListView();
             _list.Dock = DockStyle.Fill;
             _list.View = View.LargeIcon;
+            // 详情 / 列表视图用独立的小图 ImageList（见 ApplyConfigToUi 的说明）
             _list.LargeImageList = _imageList;
-            _list.SmallImageList = _imageList;
+            _list.SmallImageList = _smallImageList;
             _list.MultiSelect = false;
             _list.HideSelection = false;
             _list.LabelEdit = false;
@@ -1089,6 +1161,10 @@ namespace BlockLibraryManager
             _list.ItemDrag += new ItemDragEventHandler(OnListItemDrag);
             _list.DragEnter += new DragEventHandler(OnListDragEnter);
             _list.DragDrop += new DragEventHandler(OnListDragDrop);
+            // v1.51.12：WinForms 要求在每次 DragOver 里重设 e.Effect，只挂 DragEnter 的话
+            // 鼠标在列表内移动时光标会自己掉回"禁止放置"，部分宿主下连 DragDrop
+            // 都不再触发。复用同一个处理器就够了（它只做 Effect 判定）。
+            _list.DragOver += new DragEventHandler(OnListDragEnter);
             _list.SelectedIndexChanged += new EventHandler(OnListSelectionChanged);
             _list.MouseDown += new MouseEventHandler(OnListMouseDown);
             _list.Columns.Add("名称", 180);
@@ -1227,6 +1303,10 @@ namespace BlockLibraryManager
             _miTreeOpenFolder = new ToolStripMenuItem("打开文件夹位置");
             _miTreeOpenFolder.Click += new EventHandler(OnTreeOpenFolderClick);
             _menuTree.Items.Add(_miTreeOpenFolder);
+
+            _miTreeRefresh = new ToolStripMenuItem("刷新缩略图");
+            _miTreeRefresh.Click += new EventHandler(OnTreeRefreshClick);
+            _menuTree.Items.Add(_miTreeRefresh);
 
             _miTreeAddLib = new ToolStripMenuItem("添加到图库");
             _miTreeAddLib.Click += new EventHandler(OnTreeAddToLibraryClick);
@@ -1695,6 +1775,15 @@ namespace BlockLibraryManager
             AddPcSpecialFolder(computer, "视频", Environment.SpecialFolder.MyVideos);
 
             // ---- 磁盘驱动器 ----
+            //
+            // v1.51.12：**这里不再碰任何会阻塞的属性**。
+            // DriveInfo.IsReady / VolumeLabel 在断网的网络映射盘、没放盘的光驱上
+            // 会同步等待就绪信号，单次几百毫秒到几秒；以前每次 BuildTree 都在
+            // 主线程遍历一遍全部驱动器读这两个属性（外加每个盘一次 SHGetFileInfo 取图标），
+            // 而且 GetDrives() 会把所有已映射的网络盘一起带回来 ——
+            // 这是打开面板时最容易被感知的一段卡顿，甚至被当成"假死"。
+            // 现在驱动器子树先用兜底文本和通用文件夹图标立刻画出来，真实卷标与
+            // 图标由后台线程取好后再回填，用户完全不用等。
             try
             {
                 System.IO.DriveInfo[] drives = System.IO.DriveInfo.GetDrives();
@@ -1704,35 +1793,164 @@ namespace BlockLibraryManager
                     if (string.IsNullOrEmpty(root)) continue;
 
                     string label = root.TrimEnd(System.IO.Path.DirectorySeparatorChar);
-                    string display = label;
 
-                    bool ready = false;
-                    try { ready = drive.IsReady; } catch { }
-
-                    if (ready)
-                    {
-                        string typeName = DescribeDriveType(drive.DriveType);
-                        if (string.IsNullOrEmpty(typeName)) typeName = "本地磁盘";
-
-                        string volume = null;
-                        try { volume = drive.VolumeLabel; } catch { }
-
-                        display = string.IsNullOrEmpty(volume)
-                            ? typeName + " (" + label + ")"
-                            : volume + " (" + label + ")";
-                    }
+                    string display;
+                    if (!_driveLabels.TryGetValue(root, out display) || string.IsNullOrEmpty(display))
+                        display = GuessDriveDisplay(drive, label);
 
                     TreeNode node = new TreeNode(display);
                     node.Tag = new PcTag(root);
-                    ApplyPcIcon(node, root);
+                    node.ToolTipText = root;
+                    ApplyPcIconFresh(node, root);
                     computer.Nodes.Add(node);
-
-                    if (ready) AddPcDummy(node);
+                    AddPcDummy(node);                // 占位保证可展开，能否枚举由展开时决定
                 }
             }
             catch { }
 
+            StartPcDriveProbe(computer);
+
             return computer;
+        }
+
+        /// <summary>驱动器卷标缓存：盘符 → 显示文本（只在 UI 线程写，避免加锁）。</summary>
+        private readonly Dictionary<string, string> _driveLabels =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>是否已启动过后台驱动器探测（不需要每次 BuildTree 都重来）。</summary>
+        private bool _driveProbeStarted;
+
+        /// <summary>无需 IO 的驱动器显示名兜底（只用盘符与 DriveType）。</summary>
+        private static string GuessDriveDisplay(System.IO.DriveInfo drive, string label)
+        {
+            string typeName;
+            try { typeName = DescribeDriveType(drive.DriveType); }
+            catch { typeName = null; }
+
+            if (string.IsNullOrEmpty(typeName)) typeName = "本地磁盘";
+            return typeName + " (" + label + ")";
+        }
+
+        /// <summary>
+        /// 后台取全部驱动器的真实卷标 / 类型名，拿不到就算了。
+        /// 完成后回到 UI 线程回填节点文本和图标 —— 这段 replace 的可随时
+        /// 延迟，绝不能拖住目录树的首次绘制。
+        /// </summary>
+        private void StartPcDriveProbe(TreeNode computer)
+        {
+            if (_driveProbeStarted) return;
+            _driveProbeStarted = true;
+
+            TreeNodeWeak weak = new TreeNodeWeak(computer);
+
+            try
+            {
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate (object state)
+                {
+                    List<KeyValuePair<string, string>> found =
+                        new List<KeyValuePair<string, string>>();
+
+                    try
+                    {
+                        foreach (System.IO.DriveInfo drive in System.IO.DriveInfo.GetDrives())
+                        {
+                            string root = drive.Name;
+                            if (string.IsNullOrEmpty(root)) continue;
+
+                            string label = root.TrimEnd(System.IO.Path.DirectorySeparatorChar);
+
+                            bool ready;
+                            try { ready = drive.IsReady; } catch { continue; }
+                            if (!ready) continue;
+
+                            string volume = null;
+                            try { volume = drive.VolumeLabel; } catch { }
+
+                            string typeName;
+                            try { typeName = DescribeDriveType(drive.DriveType); }
+                            catch { typeName = null; }
+                            if (string.IsNullOrEmpty(typeName)) typeName = "本地磁盘";
+
+                            found.Add(new KeyValuePair<string, string>(root,
+                                string.IsNullOrEmpty(volume)
+                                    ? typeName + " (" + label + ")"
+                                    : volume + " (" + label + ")"));
+                        }
+                    }
+                    catch
+                    {
+                        // 探测失败就用兜底文本，不影响可用性
+                    }
+
+                    ApplyDriveLabelsLater(weak, found);
+                });
+            }
+            catch
+            {
+                // 线程池都排不上（极端情况）就保持兜底显示
+            }
+        }
+
+        /// <summary>后台探测完成后回到 UI 线程把卷标与真图标填回节点。</summary>
+        private void ApplyDriveLabelsLater(TreeNodeWeak weak, List<KeyValuePair<string, string>> labels)
+        {
+            if (labels == null || labels.Count == 0) return;
+
+            try
+            {
+                if (!IsHandleCreated || IsDisposed) return;
+
+                BeginInvoke(new Action(delegate
+                {
+                    TreeNode computer = weak.Target;
+                    if (computer == null || computer.TreeView == null) return;
+
+                    try
+                    {
+                        foreach (KeyValuePair<string, string> kv in labels)
+                            _driveLabels[kv.Key] = kv.Value;
+                    }
+                    catch { }
+
+                    try
+                    {
+                        if (computer.TreeView != null) computer.TreeView.BeginUpdate();
+                        try
+                        {
+                            foreach (TreeNode node in computer.Nodes)
+                            {
+                                PcTag tag = node.Tag as PcTag;
+                                if (tag == null) continue;
+
+                                string display;
+                                if (_driveLabels.TryGetValue(tag.Path, out display) && !string.IsNullOrEmpty(display))
+                                    node.Text = display;
+
+                                // 这时候已经在 Idle 回调里、树也画出来了，
+                                // 取真图标的代价用户感觉不到（后续 BuildTree 命中缓存直接返回）
+                                ApplyPcIcon(node, tag.Path);
+                            }
+                        }
+                        finally
+                        {
+                            if (computer.TreeView != null) computer.TreeView.EndUpdate();
+                        }
+                    }
+                    catch { }
+                }));
+            }
+            catch
+            {
+                // 回到 UI 失败就算了，节点保持兜底文本
+            }
+        }
+
+        /// <summary>持有 TreeNode 但不阻止其被回收（后台线程用）。</summary>
+        private sealed class TreeNodeWeak
+        {
+            private readonly WeakReference _ref;
+            public TreeNodeWeak(TreeNode node) { _ref = new WeakReference(node); }
+            public TreeNode Target { get { try { return _ref.Target as TreeNode; } catch { return null; } } }
         }
 
         /// <summary>往"此电脑"分支加一个特殊文件夹节点（路径无效时跳过）。</summary>
@@ -1744,7 +1962,7 @@ namespace BlockLibraryManager
 
             TreeNode node = new TreeNode(display);
             node.Tag = new PcTag(path);
-            ApplyPcIcon(node, path);
+            ApplyPcIconFresh(node, path);      // 真图标由后台 probe 回来再补
             node.ToolTipText = path;
             parent.Nodes.Add(node);
             AddPcDummy(node);
@@ -1774,6 +1992,30 @@ namespace BlockLibraryManager
         /// 给"此电脑"分支的节点挂系统图标（按真实路径取，带缓存），
         /// 取不到时退回普通文件夹图标。图标挂在与目录树共用的 _treeIcons 上。
         /// </summary>
+        /// <summary>
+        /// 用**已有**的图标给节点贴图；没有就用通用文件夹图标（v1.51.12）。
+        /// 与 ApplyPcIcon 的区别：绝不去调 SystemIconProvider.GetPathIcon——
+        /// 那个第一次会走真实的 SHGetFileInfo，网络盘上一次就是几十到几百毫秒。
+        /// 建树阶段必须用它，真图标由后台 probe 回来之后再补。
+        /// </summary>
+        private void ApplyPcIconFresh(TreeNode node, string path)
+        {
+            try
+            {
+                string key = "p:" + (path ?? string.Empty).ToLowerInvariant();
+                if (_treeIcons != null && _treeIcons.Images.ContainsKey(key))
+                {
+                    node.ImageKey = key;
+                    node.SelectedImageKey = key;
+                    return;
+                }
+            }
+            catch { }
+
+            node.ImageKey = IconFolderClosed;
+            node.SelectedImageKey = IconFolderOpen;
+        }
+
         private void ApplyPcIcon(TreeNode node, string path)
         {
             string fallbackKey = IconFolderClosed;
@@ -1895,12 +2137,25 @@ namespace BlockLibraryManager
                 if (_imageList.Images.Count > 0) _imageList.Images.Clear();
                 _imageList.ImageSize = new Size(size, size);
 
+                // v1.51.12：详情视图 / 列表视图**不再**共用大图 ImageList。
+                // View.Details 与 View.List 的行高（列高）由 SmallImageList.ImageSize 决定，
+                // 共用之后缩略图规格调到 120 时每行就是 120px、调到 256 就是 256px，
+                // 一屏只能看几行，滚动条长得离谱 —— 而"缩略图规格"本意只针对大图标视图。
+                // 给小图一个固定的行内尺寸，两个列表各管各的。
+                if (_smallImageList == null)
+                {
+                    _smallImageList = new ImageList();
+                    _smallImageList.ColorDepth = ColorDepth.Depth32Bit;
+                }
+                if (_smallImageList.Images.Count > 0) _smallImageList.Images.Clear();
+                _smallImageList.ImageSize = new Size(DetailRowIconSize, DetailRowIconSize);
+
                 _list.LargeImageList = null;
                 _list.SmallImageList = null;
                 _list.LargeImageList = _imageList;
-                _list.SmallImageList = _imageList;
+                _list.SmallImageList = _smallImageList;
 
-                // 自绘之后 ImageList 里只需要一张透明占位图来撑尺寸
+                // 自绘之后两个 ImageList 里各需要一张透明占位图来撑尺寸
                 EnsurePlaceholderImage();
             }
             catch (System.Exception ex)
@@ -2036,6 +2291,12 @@ namespace BlockLibraryManager
             {
                 // 绝不让布局异常冒到 AutoCAD 主循环
                 BlmLog.Write("ApplySplitterDistance 失败: " + ex.Message);
+
+                // v1.51.12：异常路径也要置位。
+                // 以前没置，于是 _split.Resize 每触发一次就重试一次、写一行日志——
+                // 用户拖一下窗口边框就是几十上百行同样的日志刷进 error.log。
+                // （左侧分割的 ApplyLeftSplitDistance 早已正确处理，两边行为不一致。）
+                _splitterApplied = true;
             }
         }
 
@@ -2043,9 +2304,21 @@ namespace BlockLibraryManager
         {
             if (disposing)
             {
+                // v1.51.12：先把 ImageList 从引用它的控件上摘下来再释放。
+                // 以前是先 Dispose(_imageList) 而在走到 base.Dispose 之前
+                // _list.LargeImageList / _tree.ImageList 还指向它 —— 期间任何一次
+                // 绘制（或销毁时的句柄回收）可能访问已释放对象抛"参数无效"。
+                if (_list != null)
+                {
+                    _list.LargeImageList = null;
+                    _list.SmallImageList = null;
+                }
+                if (_tree != null) _tree.ImageList = null;
+
                 if (_thumbnails != null)
                 {
                     _thumbnails.ThumbnailReady -= OnThumbnailReady;
+                    _thumbnails.ThumbnailReadyCounted -= OnThumbnailReady;
                     _thumbnails.Dispose();
                     _thumbnails = null;
                 }
@@ -2053,6 +2326,11 @@ namespace BlockLibraryManager
                 {
                     _imageList.Dispose();
                     _imageList = null;
+                }
+                if (_smallImageList != null)
+                {
+                    _smallImageList.Dispose();
+                    _smallImageList = null;
                 }
                 if (_treeIcons != null)
                 {

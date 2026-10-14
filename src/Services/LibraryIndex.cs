@@ -429,7 +429,8 @@ namespace BlockLibraryManager
         {
             string x = a != null ? a.Name : string.Empty;
             string y = b != null ? b.Name : string.Empty;
-            return string.Compare(x, y, StringComparison.CurrentCultureIgnoreCase);
+            // 同 SortBlockItems：Ordinal 比 CurrentCulture 快一到两个数量级
+            return string.Compare(x, y, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>取得某个分类目录下的图块（不含子目录）。</summary>
@@ -452,18 +453,29 @@ namespace BlockLibraryManager
             List<BlockItem> result = new List<BlockItem>();
             if (node == null) return result;
 
+            // v1.51.12：以前是"递归里每层都 SortBlockItems(result)"——
+            // 每一层子树都把自己整排一遍，再把已经排好的结果 AddRange 到上层
+            // 重新排。树深 8 层、4400 个条目就是 8 轮全量排序 +
+            // 8 次全量复制，而 SearchSubCategories 默认开启，等于每次选分类都踩一遍。
+            // 拆成"只收集 / 只在最外层排一次"。
+            CollectRecursive(node, result);
+            SortBlockItems(result);
+            return result;
+        }
+
+        private void CollectRecursive(CategoryNode node, List<BlockItem> acc)
+        {
+            if (node == null) return;
+
             if (!string.IsNullOrEmpty(node.FullPath))
             {
                 List<BlockItem> found;
                 if (_byDirectory.TryGetValue(Normalize(node.FullPath), out found))
-                    result.AddRange(found);
+                    acc.AddRange(found);
             }
 
             foreach (CategoryNode child in node.Children)
-                result.AddRange(GetBlocksRecursive(child));
-
-            SortBlockItems(result);
-            return result;
+                CollectRecursive(child, acc);
         }
 
         /// <summary>
@@ -595,14 +607,26 @@ namespace BlockLibraryManager
             return name.EndsWith(pattern, StringComparison.OrdinalIgnoreCase);
         }
 
-        private static void SortBlockItems(List<BlockItem> items)
-        {
-            items.Sort(delegate (BlockItem a, BlockItem b)
+        /// <summary>
+        /// 图块列表排序比较器。
+        /// v1.51.12：比较器缓存成静态只读委托，避免每次 Sort 都新建委托对象；
+        /// 更重要的一点是**改用 OrdinalIgnoreCase** —— CurrentCulture 比较要走
+        /// 系统的排序规则表（ICU），单次比 Ordinal 慢一到两个数量级，
+        /// 4400 条 × 每轮十几次比较 = 几十万次文化敏感比较纯属 CPU 空转，
+        /// 而且在中文图库下排出来的顺序也不是用户直觉的顺序（按拼音/笔画，
+        /// 而不是码位）。
+        /// </summary>
+        private static readonly Comparison<BlockItem> _blockComparison =
+            delegate (BlockItem a, BlockItem b)
             {
                 string x = a != null ? a.Name : string.Empty;
                 string y = b != null ? b.Name : string.Empty;
-                return string.Compare(x, y, StringComparison.CurrentCultureIgnoreCase);
-            });
+                return string.Compare(x, y, StringComparison.OrdinalIgnoreCase);
+            };
+
+        private static void SortBlockItems(List<BlockItem> items)
+        {
+            items.Sort(_blockComparison);
         }
     }
 }

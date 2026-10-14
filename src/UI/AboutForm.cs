@@ -18,10 +18,10 @@ namespace BlockLibraryManager
         public const string SubTitle = "Block Library Manager for AutoCAD";
 
         /// <summary>插件版本号。</summary>
-        public const string Version = "1.51.7";
+        public const string Version = "1.51.13";
 
         /// <summary>发布日期。</summary>
-        public const string BuildDate = "2026-10-12";
+        public const string BuildDate = "2026-10-14";
 
         /// <summary>作者 / 开发者。留空则不显示该行。</summary>
         public const string Author = "悟空";

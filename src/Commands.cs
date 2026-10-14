@@ -71,6 +71,48 @@ namespace BlockLibraryManager
             }
         }
 
+        /// <summary>
+        /// 摘掉自定义启动命令挂上去的全部事件（插件卸载 / Terminate 时调用）。
+        /// v1.51.12：以前只在 Plugin.Terminate 里 Shutdown 面板，delegate 还挂着。
+        /// netload 二次加载或插件重载后，旧委托随 UnknownCommand 再触发一次
+        /// Toggle，去重建一个已经 Dispose 的窗体；而且每个文档一份、只增不减。
+        /// </summary>
+        public static void UnhookCustomLaunchCommand()
+        {
+            try
+            {
+                Autodesk.AutoCAD.ApplicationServices.DocumentCollection dm =
+                    Application.DocumentManager;
+                if (dm == null) return;
+
+                dm.DocumentCreated -= new DocumentCollectionEventHandler(OnDocumentCreated);
+
+                foreach (Autodesk.AutoCAD.ApplicationServices.Document doc in dm)
+                    UnhookDocument(doc);
+            }
+            catch
+            {
+                // 卸载阶段忽略
+            }
+
+            _customLaunchCommand = null;
+        }
+
+        private static void UnhookDocument(Document doc)
+        {
+            if (doc == null) return;
+#if BLM_ACAD
+            try { doc.UnknownCommand -= OnDocUnknownCommand; } catch { }
+#else
+            try
+            {
+                CadHost.TryUnhook(doc, "UnknownCommand", _unknownBound);
+                _unknownBound = null;
+            }
+            catch { }
+#endif
+        }
+
         private static void OnDocumentCreated(object sender, DocumentCollectionEventArgs e)
         {
             try { HookDocument(e != null ? e.Document : null); }

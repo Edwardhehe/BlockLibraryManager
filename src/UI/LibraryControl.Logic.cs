@@ -25,41 +25,13 @@ namespace BlockLibraryManager
         public void ReloadLibrary(bool restoreSelection)
         {
             if (_config == null) return;
+            if (_index == null) return;      // Initialize 半途抛过异常时这里会 NRE（v1.51.12）
 
-            string previousPath = GetSelectedCategoryPath();
-            bool previousWasRecent = (_tree != null && _tree.SelectedNode != null &&
-                                      ReferenceEquals(_tree.SelectedNode.Tag, RecentTag));
-
-            Cursor saved = Cursor.Current;
-            Cursor.Current = Cursors.WaitCursor;
-            try
-            {
-                _index.Reload();
-                BuildTree();
-
-                if (restoreSelection)
-                {
-                    if (previousWasRecent) SelectRecentNode();
-                    else SelectNodeByPath(previousPath);
-                }
-                else
-                {
-                    SelectNodeByPath(_config.LastCategoryPath);
-                }
-
-                if (_tree != null && _tree.SelectedNode == null && _tree.Nodes.Count > 0)
-                    _tree.SelectedNode = _tree.Nodes[0];
-
-                RefreshCurrentView();
-            }
-            finally
-            {
-                Cursor.Current = saved;
-
-                string error = _index.LastError;
-                if (!string.IsNullOrEmpty(error))
-                    SetStatus("扫描完成，部分目录无法访问：" + error);
-            }
+            // v1.51.12：这条路径以前是**主线程同步整盘重扫**（几千个 DWG，
+            // 无进度提示），命令 BLOCKLIBR 就是走它 → CAD 在命令执行期间完全无响应。
+            // 现在已经没有一个调用点需要同步语义了，前面加过守卫之后直接
+            // 转到后台扫描路径，防止以后有人再被它坑一次。
+            ReloadWithProgress(restoreSelection ? GetSelectedCategoryPath() : null);
         }
 
         /// <summary>
@@ -431,7 +403,8 @@ namespace BlockLibraryManager
         // ImageList 的反复增删。
 
         /// <summary>
-        /// 可见性切换的一对三角形按钮在缩略图（或图标矩形）里的整体范围：底部居中。
+        /// 可见性切换的一对三角形按钮在缩略图（实际绘制矩形）里的整体范围：
+        /// 水平居中、垂直贴底，**离底边留 10px**（用户指定，v1.51.9）。
         /// 绘制与点击命中共用同一套比例，保证两者对得上。
         /// </summary>
         private static Rectangle GetTrianglePairBounds(int width, int height)
@@ -439,14 +412,33 @@ namespace BlockLibraryManager
             if (width < 8) width = 8;
             if (height < 8) height = 8;
 
-            int h = height / 5;
-            if (h < 15) h = Math.Min(15, height - 2);
-            if (h > height - 2) h = height - 2;
+            int bottomGap = 10;                     // 离缩略图底边的间距
+            const float scale = 0.36f;              // 用户指定：在 0.3 倍基础上再放大 1.2 倍（0.3 × 1.2）
+
+            // v1.51.12：小缩略图（列表视图只有几十像素高）时，10px 底边间距 + 6px
+            // 按钮会把 y 算成负数 —— 按钮画到图的上边界之外，
+            // 既看不见又点不中。间距让位于图宽高：最多占图高的 1/6。
+            int maxGap = Math.Max(0, height / 6);
+            if (bottomGap > maxGap) bottomGap = maxGap;
+
+            int h = (int)Math.Round(height / 5f * scale);
+            if (h < 8) h = 8;                       // 再小就看不见了，保底 8px（命中判定另有 3px 放宽）
+            if (h > height - bottomGap - 2) h = height - bottomGap - 2;   // 留出底边后仍要在图内
+            if (h < 6) h = 6;
+            if (h > height) h = height;
 
             int w = h * 2 + 2;                       // 两个方形按钮 + 中间 2px 间隙
             if (w > width - 2) w = width - 2;
+            if (w < 4) w = 4;
 
-            return new Rectangle((width - w) / 2, height - h - 3, w, h);
+            // x / y 都要 clamp 回图内：h 被顶到接近 height、或 w 大于 width 时
+            // 上面算出来的坐标可能是负的，那样按钮就跑到图上边界之外了。
+            int y = height - h - bottomGap;
+            if (y < 0) y = Math.Max(0, height - h);
+            int x = (width - w) / 2;
+            if (x < 0) x = 0;
+
+            return new Rectangle(x, y, w, h);
         }
 
         /// <summary>朝左三角形按钮（上一个可见性状态）的位置：底部居中、靠左。</summary>
@@ -523,15 +515,23 @@ namespace BlockLibraryManager
                 List<string> states = _thumbnails.GetVisibilityStates(item);
                 if (states == null || states.Count < 2) return;
 
-                Rectangle iconRect = hit.Item.GetBounds(System.Windows.Forms.ItemBoundsPortion.Icon);
+                // 与绘制侧共用同一个矩形算法：贴"实际画出来的缩略图"定位，
+                // 不再按图标格子算（v1.51.9）——否则按钮画在图下方留白里，
+                // 画出来的位置和点的位置对不上，看着就像功能没实现。
+                Rectangle imageRect = GetDrawnImageRect(hit.Item, hit.Item.Bounds,
+                    hit.Item.GetBounds(System.Windows.Forms.ItemBoundsPortion.Icon));
 
-                Rectangle prev = GetPrevTriangleRect(iconRect.Width, iconRect.Height);
-                prev.Offset(iconRect.Location);
-                Rectangle next = GetNextTriangleRect(iconRect.Width, iconRect.Height);
-                next.Offset(iconRect.Location);
+                Rectangle prev = GetPrevTriangleRect(imageRect.Width, imageRect.Height);
+                prev.Offset(imageRect.Location);
+                Rectangle next = GetNextTriangleRect(imageRect.Width, imageRect.Height);
+                next.Offset(imageRect.Location);
 
-                bool prevHit = prev.Contains(e.Location);
-                bool nextHit = next.Contains(e.Location);
+                // 按钮本身不大，命中判定向外放宽 3px，避免"看得见却点不中"
+                Rectangle prevPad = Rectangle.Inflate(prev, 3, 3);
+                Rectangle nextPad = Rectangle.Inflate(next, 3, 3);
+
+                bool prevHit = prevPad.Contains(e.Location);
+                bool nextHit = nextPad.Contains(e.Location);
                 if (!prevHit && !nextHit) return;
 
                 hit.Item.Selected = true;
@@ -546,6 +546,44 @@ namespace BlockLibraryManager
             catch
             {
                 // 切换失败不影响列表正常选择
+            }
+        }
+
+        /// <summary>
+        /// 判定列表客户区某点是否落在可见性 ◀ ▶ 按钮上（与 OnListMouseDown
+        /// 完全同一套几何：实际绘制矩形 + 3px 命中放宽）。
+        /// 双击插入前必须先挡一下：在按钮上快速点两下切换状态，
+        /// ListView 会把第二次点击当双击触发"插入到当前图形"（v1.51.9 用户反馈）。
+        /// </summary>
+        private bool IsVisibilityButtonHit(Point listPoint)
+        {
+            try
+            {
+                if (_thumbnails == null || _list == null) return false;
+
+                System.Windows.Forms.ListViewHitTestInfo hit = _list.HitTest(listPoint);
+                if (hit.Item == null) return false;
+
+                BlockItem item = hit.Item.Tag as BlockItem;
+                if (item == null) return false;
+
+                List<string> states = _thumbnails.GetVisibilityStates(item);
+                if (states == null || states.Count < 2) return false;
+
+                Rectangle imageRect = GetDrawnImageRect(hit.Item, hit.Item.Bounds,
+                    hit.Item.GetBounds(System.Windows.Forms.ItemBoundsPortion.Icon));
+
+                Rectangle prev = GetPrevTriangleRect(imageRect.Width, imageRect.Height);
+                prev.Offset(imageRect.Location);
+                Rectangle next = GetNextTriangleRect(imageRect.Width, imageRect.Height);
+                next.Offset(imageRect.Location);
+
+                return Rectangle.Inflate(prev, 3, 3).Contains(listPoint)
+                    || Rectangle.Inflate(next, 3, 3).Contains(listPoint);
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -620,10 +658,20 @@ namespace BlockLibraryManager
 
         private void OnThumbnailReady(BlockItem item)
         {
+            OnThumbnailReady(item, true);
+        }
+
+        /// <summary>
+        /// counted = false 表示这条通知不属于本轮缩略图进度（元数据补测完成的通知）。
+        /// 以前一律 _thumbDone++，而元数据条目从来没被登记进 _thumbTotal，
+        /// 于是进度会被推着走 —— 状态栏出现"已全部生成"但数字对不上。
+        /// </summary>
+        private void OnThumbnailReady(BlockItem item, bool counted)
+        {
             if (IsDisposed) return;
             if (item == null || _list == null) return;
 
-            _thumbDone++;
+            if (counted) _thumbDone++;
 
             // 自绘之后这里几乎什么都不用做：图已经进内存缓存，
             // 绘制事件自己会去取，屏幕外的项压根不会取。
@@ -696,7 +744,10 @@ namespace BlockLibraryManager
 
             // 炸开：勾选后插入时分解为基本图元（默认不勾选）
             options.ExplodeAfterInsert = _chkExplode != null && _chkExplode.Checked;
-            options.UpdateExistingDefinition = _chkUpdateDef.Checked;
+            // v1.51.12：这里漏判了 null —— 同方法上下几行的 CheckBox 都做了保护，
+            // 只有它没有，控件创建失败或 Initialize 半途出错时会 NRE，
+            // 直接中断"插入"这条主流程。
+            options.UpdateExistingDefinition = _chkUpdateDef != null && _chkUpdateDef.Checked;
 
             // 图层：勾选后插入的图块归到 0 图层；不勾选保持图块所在图层
             options.ForceLayerZero = _chkLayerZero != null && _chkLayerZero.Checked;
